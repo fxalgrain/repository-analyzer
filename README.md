@@ -9,6 +9,7 @@ This Python CLI script calculates the "Lead Time for Change" DORA metric for a g
 * Uses `GitPython` for robust Git repository interaction.
 * Supports output in `CSV` and `JSON` formats.
 * Configurable repository path and output file.
+* Analyses several repositories in one run (repeat `-r`, or list them in the config file) and tags every row with its repository.
 * Caches per-tag results between runs, so only new tags are processed after the first run.
 * Reports per service (default) or per team, using a team membership config file.
 
@@ -70,13 +71,42 @@ By default metrics are reported per service. To report per team instead, describ
 Members are matched, case-insensitively, against the commit **author's** email or name. Then run:
 
 ```bash
-python dora_metrics.py -r <repo_path> --group-by team --teams-config teams.json
+python dora_metrics.py -r <repo_path> --group-by team --config teams.json
 ```
 
 * A release counts for a team when at least one of its members authored a commit in it.
 * Lead time is computed from the members' commits only.
 * A person listed in several teams is counted in each of them.
-* The detailed report adds `team_name`, `author_name` and `author_email` columns; the summary is grouped by month and team (`year_month,team_name,average_lead_time_days,release_count`).
+* The detailed report adds `team_name`, `author_name` and `author_email` columns; the summary is grouped by month, repository and team (`year_month,repo_name,team_name,average_lead_time_days,release_count,commit_count`).
+
+### Several repositories
+
+Pass `-r` several times, or list the repositories in the config file (the same file as the teams, see `teams.example.json`):
+
+```json
+{
+  "teams": { "team-a": ["alice@example.com"] },
+  "repositories": [
+    "../service-repo",
+    {"path": "../frontend", "name": "web", "monorepo": false}
+  ]
+}
+```
+
+```bash
+python dora_metrics.py --config teams.json                    # service report over every listed repo
+python dora_metrics.py --config teams.json --group-by team    # team report over every listed repo
+python dora_metrics.py -r ../a -r ../b                        # without a config file
+```
+
+* Relative paths in the config are resolved against the config file's directory; `~` is expanded. `-r` takes precedence over the config's `repositories`.
+* `name` (default: directory name) is the `repo_name` in the output; duplicates get a numeric suffix. `monorepo` overrides `--monorepo` for that repository.
+* Both reports gain a `repo_name` column, and the summary is grouped by month, repository and service/team. Non-monorepo repositories appear as `_overall_`.
+* The cache is shared by all repositories (the repository path is part of each key).
+
+### HTML report
+
+Open `dora_report.html` and drop `dora.csv` / `dora_summary.csv` onto it (or serve the folder with `python3 -m http.server`). When the data covers several repositories, a filter lets you pick the repositories to include and switch the charts between service/team and repository grouping.
 
 ### Caching
 

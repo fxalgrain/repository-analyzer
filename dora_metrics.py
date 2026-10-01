@@ -24,11 +24,11 @@ DEFAULT_SERVICE_NAME_FOR_SUMMARY = "_overall_"
 
 SERVICE_FIELDNAMES = [
     "commit_hash", "commit_summary", "commit_author_date",
-    "release_tag", "release_date", "lead_time_days", "service_name"
+    "release_tag", "release_date", "lead_time_days", "service_name", "repo_name"
 ]
 TEAM_FIELDNAMES = [
     "commit_hash", "commit_summary", "commit_author_date",
-    "release_tag", "release_date", "lead_time_days", "service_name",
+    "release_tag", "release_date", "lead_time_days", "service_name", "repo_name",
     "team_name", "author_name", "author_email"
 ]
 
@@ -158,9 +158,12 @@ def parse_monorepo_tag(tag_name: str) -> Optional[Tuple[str, str]]:
 
 
 def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool,
-                                cache_path: Optional[str] = None) -> List[MetricEntry]:
+                                cache: Optional[Cache] = None,
+                                repo_name: Optional[str] = None) -> List[MetricEntry]:
     """
-    Calculates Lead Time for Change.
+    Calculates Lead Time for Change for one repository. Every entry is labelled with repo_name
+    (kept out of the cache, so renaming a repository in the config never serves stale labels).
+    New entries are added to `cache` in place; the caller persists it.
     - Uses repo.iter_commits with no_merges=True and invert_grep=True for filtering.
     - If is_monorepo:
         - Tracks previous tag commit per service.
@@ -189,9 +192,8 @@ def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool,
     all_metrics: List[MetricEntry] = []
     previous_tag_commits_per_service: Dict[str, str] = {}
     global_previous_tag_commit_sha: Optional[str] = None
-    cache: Optional[Cache] = load_cache(cache_path) if cache_path else None
+    repo_name = repo_name or os.path.basename(os.path.normpath(repo_path))
     cache_hits = 0
-    cache_updated = False
 
     release_commit_grep_pattern = r"chore(.*): release .*"
     print(f"INFO: Commits will be filtered using iter_commits with no_merges=True "
@@ -252,9 +254,8 @@ def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool,
                 continue
             if cache is not None:
                 cache["entries"][cache_key] = tag_entries
-                cache_updated = True
 
-        all_metrics.extend(tag_entries)
+        all_metrics.extend({**entry, "repo_name": repo_name} for entry in tag_entries)
         commits_processed_for_this_tag = len(tag_entries)
 
         tag_label = f"Tag '{current_tag_ref.name}'"
@@ -278,39 +279,85 @@ def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool,
         elif not is_monorepo:
             global_previous_tag_commit_sha = current_release_commit_hexsha
 
-    if cache is not None and cache_path:
+    if cache is not None:
         print(f"INFO: Cache: {cache_hits} of {len(sorted_annotated_tags)} tags reused.")
-        if cache_updated:
-            save_cache(cache, cache_path)
     return all_metrics
 
 
-def load_teams_config(config_path: str) -> Optional[Dict[str, List[str]]]:
+RepoSpec = Dict[str, Any]  # {"path": str, "name": Optional[str], "monorepo": Optional[bool]}
+
+
+def load_config(config_path: str) -> Optional[Tuple[Dict[str, List[str]], List[RepoSpec]]]:
     """
-    Loads a teams config file (JSON): {"teams": {"team-name": ["email-or-name", ...]}}.
-    Members are matched case-insensitively against the commit author's email or name.
-    Returns {team_name: [lowercased identifiers]} or None if the file is unusable.
+    Loads the JSON config file:
+      {
+        "teams": {"team-name": ["email-or-name", ...]},                       (optional)
+        "repositories": ["path", {"path": "...", "name": "...", "monorepo": false}]   (optional)
+      }
+    Team members are matched case-insensitively against the commit author's email or name.
+    Relative repository paths are resolved against the config file's directory.
+    Returns ({team_name: [lowercased identifiers]}, [repo specs]) or None if the file is unusable.
     """
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
     except (IOError, json.JSONDecodeError) as e:
-        print(f"Error reading teams config '{config_path}': {e}", file=sys.stderr)
+        print(f"Error reading config '{config_path}': {e}", file=sys.stderr)
+        return None
+    if not isinstance(config, dict):
+        print(f"Error: config '{config_path}' must be a JSON object.", file=sys.stderr)
         return None
 
-    teams = config.get("teams") if isinstance(config, dict) else None
-    if not isinstance(teams, dict) or not teams:
-        print(f"Error: teams config '{config_path}' must contain a non-empty 'teams' object "
-              "mapping team names to lists of members.", file=sys.stderr)
+    teams_raw = config.get("teams", {})
+    if not isinstance(teams_raw, dict):
+        print(f"Error: 'teams' in '{config_path}' must map team names to lists of members.", file=sys.stderr)
         return None
-
-    result: Dict[str, List[str]] = {}
-    for team_name, members in teams.items():
+    teams: Dict[str, List[str]] = {}
+    for team_name, members in teams_raw.items():
         if not isinstance(members, list) or not all(isinstance(m, str) for m in members):
             print(f"Error: members of team '{team_name}' must be a list of strings.", file=sys.stderr)
             return None
-        result[team_name] = [m.strip().lower() for m in members if m.strip()]
-    return result
+        teams[team_name] = [m.strip().lower() for m in members if m.strip()]
+
+    repos_raw = config.get("repositories", [])
+    if not isinstance(repos_raw, list):
+        print(f"Error: 'repositories' in '{config_path}' must be a list.", file=sys.stderr)
+        return None
+    base_dir = os.path.dirname(os.path.abspath(config_path))
+    repos: List[RepoSpec] = []
+    for item in repos_raw:
+        spec = {"path": item} if isinstance(item, str) else item
+        if not isinstance(spec, dict) or not isinstance(spec.get("path"), str):
+            print("Error: each repository must be a path string or an object with a 'path'.", file=sys.stderr)
+            return None
+        if not isinstance(spec.get("name", ""), str) or not isinstance(spec.get("monorepo", True), bool):
+            print(f"Error: repository '{spec['path']}': 'name' must be a string and 'monorepo' a boolean.",
+                  file=sys.stderr)
+            return None
+        path = os.path.expanduser(spec["path"])
+        repos.append({
+            "path": os.path.normpath(os.path.join(base_dir, path)),
+            "name": spec.get("name") or None,
+            "monorepo": spec.get("monorepo"),
+        })
+    return teams, repos
+
+
+def unique_repo_names(specs: List[RepoSpec]) -> List[str]:
+    """Display name per repo: explicit name, else directory name; duplicates get a numeric suffix."""
+    seen: Dict[str, int] = {}
+    names: List[str] = []
+    for spec in specs:
+        base = spec.get("name") or os.path.basename(os.path.normpath(spec["path"]))
+        seen[base] = seen.get(base, 0) + 1
+        if seen[base] > 1:
+            name = f"{base}-{seen[base]}"
+            print(f"Warning: repository name '{base}' is used more than once; "
+                  f"'{spec['path']}' is reported as '{name}'. Set a 'name' to choose.", file=sys.stderr)
+        else:
+            name = base
+        names.append(name)
+    return names
 
 
 def assign_metrics_to_teams(metrics_data: List[MetricEntry],
@@ -332,17 +379,18 @@ def assign_metrics_to_teams(metrics_data: List[MetricEntry],
     return team_metrics
 
 
-def generate_summary_data(metrics_data: List[MetricEntry], is_monorepo: bool,
+def generate_summary_data(metrics_data: List[MetricEntry],
                           group_field: str = "service_name") -> List[SummaryEntry]:
     """
-    Aggregates detailed metrics data to produce a summary per (Year-Month, Service)
-    or, with group_field="team_name", per (Year-Month, Team).
-    Calculates average lead time and count of releases (unique tags).
+    Aggregates detailed metrics data to produce a summary per (Year-Month, Repository, Service)
+    or, with group_field="team_name", per (Year-Month, Repository, Team).
+    Calculates average lead time, count of releases (unique tags per repository) and commits.
+    Entries without a service (non-monorepo repositories) are grouped as '_overall_'.
     """
     if not metrics_data:
         return []
 
-    grouped_data: Dict[Tuple[str, str], Dict[str, Any]] = defaultdict(
+    grouped_data: Dict[Tuple[str, str, str], Dict[str, Any]] = defaultdict(
         lambda: {'lead_times_for_avg': [], 'release_tags_for_count': set()}
     )
 
@@ -352,37 +400,27 @@ def generate_summary_data(metrics_data: List[MetricEntry], is_monorepo: bool,
         except ValueError:
             print(f"Warning: Could not parse release_date '{metric['release_date']}' for metric. Skipping for summary.", file=sys.stderr)
             continue
-            
-        year_month = release_dt.strftime("%Y-%m")
-        
-        raw_service_name = metric.get(group_field)
-        if group_field == "team_name" or (is_monorepo and raw_service_name):
-            current_service_name_for_grouping = raw_service_name
-        else:
-            current_service_name_for_grouping = DEFAULT_SERVICE_NAME_FOR_SUMMARY
 
-        key = (year_month, current_service_name_for_grouping)
-        
+        year_month = release_dt.strftime("%Y-%m")
+        group_name = metric.get(group_field) or DEFAULT_SERVICE_NAME_FOR_SUMMARY
+        key = (year_month, metric.get('repo_name') or "", group_name)
+
         grouped_data[key]['lead_times_for_avg'].append(metric['lead_time_days'])
         grouped_data[key]['release_tags_for_count'].add(metric['release_tag'])
 
     final_summary_list: List[SummaryEntry] = []
-    for (year_month, service_name), data in grouped_data.items():
-        avg_lead_time = (
-            sum(data['lead_times_for_avg']) / len(data['lead_times_for_avg'])
-            if data['lead_times_for_avg']
-            else 0.0
-        )
-        tag_count = len(data['release_tags_for_count'])
-        
+    for (year_month, repo_name, group_name), data in grouped_data.items():
+        lead_times = data['lead_times_for_avg']
         final_summary_list.append({
             "year_month": year_month,
-            group_field: service_name,
-            "average_lead_time_days": round(avg_lead_time, 4),
-            "release_count": tag_count
+            "repo_name": repo_name,
+            group_field: group_name,
+            "average_lead_time_days": round(sum(lead_times) / len(lead_times), 4),
+            "release_count": len(data['release_tags_for_count']),
+            "commit_count": len(lead_times)
         })
 
-    final_summary_list.sort(key=lambda x: (x[group_field], x['year_month']))
+    final_summary_list.sort(key=lambda x: (x['repo_name'], x[group_field], x['year_month']))
     return final_summary_list
 
 
@@ -420,7 +458,8 @@ def write_summary_report(summary_data: List[SummaryEntry], summary_output_file: 
     print(f"Writing summary report to '{summary_output_file}'...")
     try:
         with open(summary_output_file, 'w', newline='', encoding='utf-8') as f:
-            fieldnames = ["year_month", group_field, "average_lead_time_days", "release_count"]
+            fieldnames = ["year_month", "repo_name", group_field, "average_lead_time_days",
+                          "release_count", "commit_count"]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             if summary_data:
@@ -435,16 +474,17 @@ def write_summary_report(summary_data: List[SummaryEntry], summary_output_file: 
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Calculate Lead Time for Change DORA metric for a Git repository. "
-            "Outputs a detailed per-commit report and a monthly summary report per service."
+            "Calculate Lead Time for Change DORA metric for one or several Git repositories. "
+            "Outputs a detailed per-commit report and a monthly summary report per repository and service/team."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter # Shows defaults in help
     )
     parser.add_argument(
         "-r", "--repo-path",
-        type=str,
-        default=".",
-        help="File path to the local Git repository."
+        action="append",
+        default=None,
+        help=("File path to a local Git repository; repeat to analyse several. "
+              "Defaults to the 'repositories' of --config, else the current directory.")
     )
     parser.add_argument(
         "-o", "--output-file",
@@ -467,15 +507,17 @@ def main():
         default='service',
         help=("Report per service (default) or per team. In 'team' mode a release counts for a "
               "team when at least one of its members authored a commit in it, and only the "
-              "members' commits are used for lead time. Requires --teams-config.")
+              "members' commits are used for lead time. Requires teams in --config.")
     )
     parser.add_argument(
-        "--teams-config",
+        "--config", "--teams-config", dest="config",
         type=str,
         default=None,
-        help=("JSON file defining teams: "
-              '{"teams": {"team-name": ["member@example.com", "Member Name"]}}. '
-              "Members are matched on commit author email or name (case-insensitive).")
+        help=("JSON config file: "
+              '{"teams": {"team-name": ["member@example.com", "Member Name"]}, '
+              '"repositories": ["path", {"path": "...", "name": "...", "monorepo": false}]}. '
+              "Team members are matched on commit author email or name (case-insensitive). "
+              "See teams.example.json.")
     )
 
     parser.add_argument(
@@ -517,12 +559,26 @@ def main():
     args = parser.parse_args()
 
     teams: Optional[Dict[str, List[str]]] = None
-    if args.group_by == 'team':
-        if not args.teams_config:
-            parser.error("--group-by team requires --teams-config")
-        teams = load_teams_config(args.teams_config)
-        if teams is None:
+    config_repos: List[RepoSpec] = []
+    if args.config:
+        loaded = load_config(args.config)
+        if loaded is None:
             sys.exit(1)
+        config_teams, config_repos = loaded
+        teams = config_teams or None
+    if args.group_by == 'team' and not teams:
+        parser.error("--group-by team requires a non-empty 'teams' object in --config")
+    if args.group_by != 'team':
+        teams = None
+
+    if args.repo_path:
+        repo_specs: List[RepoSpec] = [{"path": os.path.abspath(p), "name": None, "monorepo": None}
+                                      for p in args.repo_path]
+    elif config_repos:
+        repo_specs = config_repos
+    else:
+        repo_specs = [{"path": os.path.abspath("."), "name": None, "monorepo": None}]
+    repo_names = unique_repo_names(repo_specs)
 
     # Construct full output filename with extension based on format
     base_name_from_arg = args.output_file
@@ -531,20 +587,24 @@ def main():
     base_output_name, _ = os.path.splitext(base_name_from_arg)
     detailed_output_filename = f"{base_output_name}.{args.format}"
 
-    abs_repo_path = os.path.abspath(args.repo_path)
-
     if args.clear_cache and os.path.exists(args.cache_file):
         os.remove(args.cache_file)
         print(f"INFO: Removed cache '{args.cache_file}'.")
-    
-    print(f"Analyzing Git repository at: {abs_repo_path}")
-    if args.monorepo:
-        print("INFO: Monorepo mode is ENABLED.")
-    else:
-        print("INFO: Monorepo mode is DISABLED.")
 
-    detailed_metrics_data = calculate_lead_time_metrics(
-        abs_repo_path, args.monorepo, args.cache_file if args.cache else None)
+    cache: Optional[Cache] = load_cache(args.cache_file) if args.cache else None
+    cached_before = len(cache["entries"]) if cache is not None else 0
+
+    detailed_metrics_data: List[MetricEntry] = []
+    for spec, repo_name in zip(repo_specs, repo_names):
+        is_monorepo = args.monorepo if spec.get("monorepo") is None else spec["monorepo"]
+        print(f"Analyzing Git repository '{repo_name}' at: {spec['path']} "
+              f"(monorepo mode {'ENABLED' if is_monorepo else 'DISABLED'})")
+        detailed_metrics_data.extend(
+            calculate_lead_time_metrics(spec["path"], is_monorepo, cache, repo_name))
+
+    if cache is not None and len(cache["entries"]) != cached_before:
+        save_cache(cache, args.cache_file)
+
     group_field = "service_name"
     output_fieldnames = SERVICE_FIELDNAMES
     if teams is not None:
@@ -555,7 +615,7 @@ def main():
 
     if detailed_metrics_data:
         print(f"Generated {len(detailed_metrics_data)} detailed lead time entries.")
-        summary_data = generate_summary_data(detailed_metrics_data, args.monorepo, group_field)
+        summary_data = generate_summary_data(detailed_metrics_data, group_field)
         
         summary_base_name, _ = os.path.splitext(detailed_output_filename) # Use base from detailed
         summary_output_filename = f"{summary_base_name}_summary.csv"

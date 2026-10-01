@@ -16,7 +16,7 @@ python dora_metrics.py --help
 python dora_metrics.py -r <repo_path>                       # monorepo mode (default) → dora.csv + dora_summary.csv
 python dora_metrics.py -r <repo_path> --no-monorepo         # single-service repo
 python dora_metrics.py -r <repo_path> -o out -f json        # → out.json + out_summary.csv (summary is always CSV)
-python dora_metrics.py -r <repo_path> --group-by team --teams-config teams.json   # per-team report (see teams.example.json)
+python dora_metrics.py --config teams.json [--group-by team]                      # repos + teams from a config (see teams.example.json); -r is repeatable
 ```
 
 There is no test suite, linter, or build configuration. `dora.csv` / `dora_summary.csv` in the repo root are gitignored sample outputs from a real run, useful as a reference for output shape.
@@ -33,15 +33,19 @@ Pipeline in `main()`: `calculate_lead_time_metrics` → `write_output` (detailed
   - The previous-tag pointer is tracked per service.
   - A commit counts for a service only if it touches a path under `services/{service}/` (root commits are checked by traversing the tree). This path convention is hardcoded.
 - **Lead time** = tag date − `commit.committed_datetime` (committer date, even though the output column is named `commit_author_date`), in fractional days.
-- **Summary**: grouped by (`YYYY-MM` of release date, service); `average_lead_time_days` is the mean over commits (rounded to 4 decimals), `release_count` is the number of distinct tags. In non-monorepo mode the service name is `_overall_`.
+- **Summary**: grouped by (`YYYY-MM` of release date, repo, service); `average_lead_time_days` is the mean over commits (rounded to 4 decimals), `release_count` is the number of distinct tags, `commit_count` the number of commits. In non-monorepo mode the service name is `_overall_`.
 
 ## Team mode
 
-`--group-by team --teams-config <json>` reuses the same tag/range/service-path pipeline, then `assign_metrics_to_teams` keeps only commits whose **author** (email or name, case-insensitive) is listed in a team, emitting one row per team (a person in several teams is counted in each). So a release counts for a team only if a member authored a commit in it, and lead time is averaged over the members' commits only. Detailed CSV gains `team_name`, `author_name`, `author_email`; the summary is grouped by (`YYYY-MM`, `team_name`).
+`--group-by team --config <json>` (`--teams-config` is an alias) reuses the same tag/range/service-path pipeline, then `assign_metrics_to_teams` keeps only commits whose **author** (email or name, case-insensitive) is listed in a team, emitting one row per team (a person in several teams is counted in each). So a release counts for a team only if a member authored a commit in it, and lead time is averaged over the members' commits only. Detailed CSV gains `team_name`, `author_name`, `author_email`; the summary is grouped by (`YYYY-MM`, `repo_name`, `team_name`).
+
+## Multiple repositories
+
+`main()` loops over repo specs (`-r` repeated, else `repositories` from `--config` via `load_config`, else cwd) and calls `calculate_lead_time_metrics` once per repo; per-repo `monorepo` overrides the flag. Every entry gets `repo_name` (`unique_repo_names`), added *after* the cache lookup so the cache never stores labels. Summary rows are keyed by (`YYYY-MM`, `repo_name`, service/team) and carry `commit_count`, which `dora_report.html` uses to weight averages when it merges rows (repo filter / group-by-repo).
 
 ## Cache
 
-`calculate_lead_time_metrics` caches the entries of each tag range in `.dora_cache.json` (`--cache/--no-cache`, `--cache-file`, `--clear-cache`). The key (`make_cache_key`) is repo path + tag name + tag date + `rev_spec` (commit SHAs) + service + grep pattern, so immutable git data never goes stale. The cache stores pre-team-filter entries. Bump `CACHE_VERSION` whenever the entry shape or the commit-selection logic (e.g. the `services/{service}/` convention) changes, otherwise old entries will be served.
+`calculate_lead_time_metrics` caches the entries of each tag range in `.dora_cache.json`, one file shared by all repos and loaded/saved once by `main()` (`--cache/--no-cache`, `--cache-file`, `--clear-cache`). The key (`make_cache_key`) is repo path + tag name + tag date + `rev_spec` (commit SHAs) + service + grep pattern, so immutable git data never goes stale. The cache stores pre-team-filter entries. Bump `CACHE_VERSION` whenever the entry shape or the commit-selection logic (e.g. the `services/{service}/` convention) changes, otherwise old entries will be served.
 
 ## Conventions
 

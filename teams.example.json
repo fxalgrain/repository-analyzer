@@ -2,5 +2,10 @@
   "teams": {
     "team-a": ["alice@example.com", "Bob Smith"],
     "team-b": ["carol@example.com"]
-  }
+  },
+  "repositories": [
+    "../service-repo",
+    {"path": "~/code/monorepo"},
+    {"path": "../frontend", "name": "web", "monorepo": false}
+  ]
 }
