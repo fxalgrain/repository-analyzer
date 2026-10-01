@@ -22,6 +22,103 @@ SummaryEntry = Dict[str, Any]
 
 DEFAULT_SERVICE_NAME_FOR_SUMMARY = "_overall_"
 
+SERVICE_FIELDNAMES = [
+    "commit_hash", "commit_summary", "commit_author_date",
+    "release_tag", "release_date", "lead_time_days", "service_name"
+]
+TEAM_FIELDNAMES = [
+    "commit_hash", "commit_summary", "commit_author_date",
+    "release_tag", "release_date", "lead_time_days", "service_name",
+    "team_name", "author_name", "author_email"
+]
+
+DEFAULT_CACHE_FILE = ".dora_cache.json"
+# Bump when the shape or semantics of cached entries change (e.g. path convention, new fields).
+CACHE_VERSION = 1
+
+Cache = Dict[str, Any]
+
+
+def load_cache(cache_path: str) -> Cache:
+    """Loads the cache file; returns an empty cache if missing, unreadable or from another version."""
+    empty: Cache = {"version": CACHE_VERSION, "entries": {}}
+    if not os.path.exists(cache_path):
+        return empty
+    try:
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            cache = json.load(f)
+    except (IOError, json.JSONDecodeError) as e:
+        print(f"Warning: Ignoring unreadable cache '{cache_path}': {e}", file=sys.stderr)
+        return empty
+    if not isinstance(cache, dict) or cache.get("version") != CACHE_VERSION \
+            or not isinstance(cache.get("entries"), dict):
+        print(f"INFO: Cache '{cache_path}' has an incompatible format; starting a fresh one.")
+        return empty
+    return cache
+
+
+def save_cache(cache: Cache, cache_path: str) -> None:
+    """Writes the cache atomically so an interrupted run cannot corrupt it."""
+    tmp_path = f"{cache_path}.tmp"
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, ensure_ascii=False)
+        os.replace(tmp_path, cache_path)
+    except IOError as e:
+        print(f"Warning: Could not write cache '{cache_path}': {e}", file=sys.stderr)
+
+
+def make_cache_key(repo_path: str, tag_name: str, tag_timestamp: int, rev_spec: str,
+                   service_name: Optional[str], grep_pattern: str) -> str:
+    """
+    Everything a tag's entries depend on. rev_spec holds the commit SHAs, so a moved or
+    re-created tag, or rewritten history, yields a different key instead of stale data.
+    """
+    return "|".join([repo_path, tag_name, str(tag_timestamp), rev_spec,
+                     service_name or "", grep_pattern])
+
+
+def collect_tag_entries(repo: git.Repo, rev_spec: str, grep_pattern: str,
+                        release_datetime: datetime, tag_name: str,
+                        service_name: Optional[str]) -> List[MetricEntry]:
+    """
+    Computes the metric entries for one tag's commit range. When service_name is set,
+    only commits touching 'services/{service_name}/' are kept.
+    """
+    entries: List[MetricEntry] = []
+    for commit in repo.iter_commits(rev=rev_spec, no_merges=True, invert_grep=True, grep=grep_pattern):
+        if service_name:
+            is_relevant_to_service = False
+            service_path_prefix = f"services/{service_name}/"
+            if not commit.parents:
+                for item in commit.tree.traverse(): # type: ignore
+                    if item.type == 'blob' and item.path.startswith(service_path_prefix):
+                        is_relevant_to_service = True
+                        break
+            else:
+                for file_path in commit.stats.files.keys():
+                    if file_path.startswith(service_path_prefix):
+                        is_relevant_to_service = True
+                        break
+            if not is_relevant_to_service:
+                continue
+
+        commit_start_datetime = commit.committed_datetime
+        lead_time_delta = release_datetime - commit_start_datetime
+        entries.append({
+            "commit_hash": commit.hexsha,
+            "commit_summary": commit.summary,
+            "commit_author_date": commit_start_datetime.isoformat(),
+            "release_tag": tag_name,
+            "release_date": release_datetime.isoformat(),
+            "lead_time_days": lead_time_delta.total_seconds() / (24 * 60 * 60),
+            "service_name": service_name,
+            "author_name": commit.author.name,
+            "author_email": commit.author.email
+        })
+    return entries
+
+
 def get_annotated_tags_sorted(repo: git.Repo) -> List[git.TagReference]:
     """
     Fetches all annotated tags from the repository and sorts them chronologically
@@ -60,7 +157,8 @@ def parse_monorepo_tag(tag_name: str) -> Optional[Tuple[str, str]]:
     return None
 
 
-def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool) -> List[MetricEntry]:
+def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool,
+                                cache_path: Optional[str] = None) -> List[MetricEntry]:
     """
     Calculates Lead Time for Change.
     - Uses repo.iter_commits with no_merges=True and invert_grep=True for filtering.
@@ -91,6 +189,9 @@ def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool) -> List[Metri
     all_metrics: List[MetricEntry] = []
     previous_tag_commits_per_service: Dict[str, str] = {}
     global_previous_tag_commit_sha: Optional[str] = None
+    cache: Optional[Cache] = load_cache(cache_path) if cache_path else None
+    cache_hits = 0
+    cache_updated = False
 
     release_commit_grep_pattern = r"chore(.*): release .*"
     print(f"INFO: Commits will be filtered using iter_commits with no_merges=True "
@@ -131,57 +232,31 @@ def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool) -> List[Metri
             else:
                 rev_spec = current_release_commit_hexsha
         
-        try:
-            commits_for_tag_iterator = repo.iter_commits(
-                rev=rev_spec,
-                no_merges=True,
-                invert_grep=True,
-                grep=release_commit_grep_pattern
-            )
-        except git.exc.GitCommandError as e:
-            print(f"Warning: Could not retrieve and filter commits for range '{rev_spec}' "
-                  f"(tag '{current_tag_ref.name}'). Error: {e}. Skipping this tag's new commits.", file=sys.stderr)
-            if is_monorepo and service_name_for_tag:
-                previous_tag_commits_per_service[service_name_for_tag] = current_release_commit_hexsha
-            elif not is_monorepo:
-                global_previous_tag_commit_sha = current_release_commit_hexsha
-            continue
+        cache_key = make_cache_key(repo_path, current_tag_ref.name, release_timestamp,
+                                   rev_spec, service_name_for_tag, release_commit_grep_pattern)
+        tag_entries: Optional[List[MetricEntry]] = cache["entries"].get(cache_key) if cache else None
+        if tag_entries is not None:
+            cache_hits += 1
+        else:
+            try:
+                tag_entries = collect_tag_entries(repo, rev_spec, release_commit_grep_pattern,
+                                                  release_datetime, current_tag_ref.name,
+                                                  service_name_for_tag)
+            except git.exc.GitCommandError as e:
+                print(f"Warning: Could not retrieve and filter commits for range '{rev_spec}' "
+                      f"(tag '{current_tag_ref.name}'). Error: {e}. Skipping this tag's new commits.", file=sys.stderr)
+                if is_monorepo and service_name_for_tag:
+                    previous_tag_commits_per_service[service_name_for_tag] = current_release_commit_hexsha
+                elif not is_monorepo:
+                    global_previous_tag_commit_sha = current_release_commit_hexsha
+                continue
+            if cache is not None:
+                cache["entries"][cache_key] = tag_entries
+                cache_updated = True
 
-        commits_processed_for_this_tag = 0
-        for commit in commits_for_tag_iterator:
-            if is_monorepo and service_name_for_tag:
-                is_relevant_to_service = False
-                service_path_prefix = f"services/{service_name_for_tag}/"
-                if not commit.parents:
-                    for item in commit.tree.traverse(): # type: ignore
-                        if item.type == 'blob' and item.path.startswith(service_path_prefix):
-                            is_relevant_to_service = True
-                            break
-                else:
-                    for file_path in commit.stats.files.keys():
-                        if file_path.startswith(service_path_prefix):
-                            is_relevant_to_service = True
-                            break
-                if not is_relevant_to_service:
-                    continue
-            
-            commit_start_datetime = commit.committed_datetime
-            commit_summary = commit.summary
-            lead_time_delta = release_datetime - commit_start_datetime
-            lead_time_days = lead_time_delta.total_seconds() / (24 * 60 * 60)
+        all_metrics.extend(tag_entries)
+        commits_processed_for_this_tag = len(tag_entries)
 
-            metric_entry: MetricEntry = {
-                "commit_hash": commit.hexsha,
-                "commit_summary": commit_summary,
-                "commit_author_date": commit_start_datetime.isoformat(),
-                "release_tag": current_tag_ref.name,
-                "release_date": release_datetime.isoformat(),
-                "lead_time_days": lead_time_days,
-                "service_name": service_name_for_tag if is_monorepo else None
-            }
-            all_metrics.append(metric_entry)
-            commits_processed_for_this_tag +=1
-        
         tag_label = f"Tag '{current_tag_ref.name}'"
         if is_monorepo and service_name_for_tag:
             tag_label += f" (Service: {service_name_for_tag})"
@@ -202,13 +277,66 @@ def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool) -> List[Metri
             previous_tag_commits_per_service[service_name_for_tag] = current_release_commit_hexsha
         elif not is_monorepo:
             global_previous_tag_commit_sha = current_release_commit_hexsha
-            
+
+    if cache is not None and cache_path:
+        print(f"INFO: Cache: {cache_hits} of {len(sorted_annotated_tags)} tags reused.")
+        if cache_updated:
+            save_cache(cache, cache_path)
     return all_metrics
 
 
-def generate_summary_data(metrics_data: List[MetricEntry], is_monorepo: bool) -> List[SummaryEntry]:
+def load_teams_config(config_path: str) -> Optional[Dict[str, List[str]]]:
     """
-    Aggregates detailed metrics data to produce a summary per (Year-Month, Service).
+    Loads a teams config file (JSON): {"teams": {"team-name": ["email-or-name", ...]}}.
+    Members are matched case-insensitively against the commit author's email or name.
+    Returns {team_name: [lowercased identifiers]} or None if the file is unusable.
+    """
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+    except (IOError, json.JSONDecodeError) as e:
+        print(f"Error reading teams config '{config_path}': {e}", file=sys.stderr)
+        return None
+
+    teams = config.get("teams") if isinstance(config, dict) else None
+    if not isinstance(teams, dict) or not teams:
+        print(f"Error: teams config '{config_path}' must contain a non-empty 'teams' object "
+              "mapping team names to lists of members.", file=sys.stderr)
+        return None
+
+    result: Dict[str, List[str]] = {}
+    for team_name, members in teams.items():
+        if not isinstance(members, list) or not all(isinstance(m, str) for m in members):
+            print(f"Error: members of team '{team_name}' must be a list of strings.", file=sys.stderr)
+            return None
+        result[team_name] = [m.strip().lower() for m in members if m.strip()]
+    return result
+
+
+def assign_metrics_to_teams(metrics_data: List[MetricEntry],
+                            teams: Dict[str, List[str]]) -> List[MetricEntry]:
+    """
+    Keeps only commits authored by a team member and tags each with its team.
+    A commit authored by someone in several teams yields one entry per team.
+    Releases without any member commit therefore produce no entry for that team.
+    """
+    team_metrics: List[MetricEntry] = []
+    for metric in metrics_data:
+        identifiers = {
+            (metric.get("author_email") or "").lower(),
+            (metric.get("author_name") or "").lower(),
+        }
+        for team_name, members in teams.items():
+            if identifiers.intersection(members):
+                team_metrics.append({**metric, "team_name": team_name})
+    return team_metrics
+
+
+def generate_summary_data(metrics_data: List[MetricEntry], is_monorepo: bool,
+                          group_field: str = "service_name") -> List[SummaryEntry]:
+    """
+    Aggregates detailed metrics data to produce a summary per (Year-Month, Service)
+    or, with group_field="team_name", per (Year-Month, Team).
     Calculates average lead time and count of releases (unique tags).
     """
     if not metrics_data:
@@ -227,8 +355,8 @@ def generate_summary_data(metrics_data: List[MetricEntry], is_monorepo: bool) ->
             
         year_month = release_dt.strftime("%Y-%m")
         
-        raw_service_name = metric.get('service_name')
-        if is_monorepo and raw_service_name:
+        raw_service_name = metric.get(group_field)
+        if group_field == "team_name" or (is_monorepo and raw_service_name):
             current_service_name_for_grouping = raw_service_name
         else:
             current_service_name_for_grouping = DEFAULT_SERVICE_NAME_FOR_SUMMARY
@@ -249,16 +377,17 @@ def generate_summary_data(metrics_data: List[MetricEntry], is_monorepo: bool) ->
         
         final_summary_list.append({
             "year_month": year_month,
-            "service_name": service_name,
+            group_field: service_name,
             "average_lead_time_days": round(avg_lead_time, 4),
             "release_count": tag_count
         })
 
-    final_summary_list.sort(key=lambda x: (x['service_name'], x['year_month']))
+    final_summary_list.sort(key=lambda x: (x[group_field], x['year_month']))
     return final_summary_list
 
 
-def write_output(metrics_data: List[MetricEntry], output_file: str, file_format: str):
+def write_output(metrics_data: List[MetricEntry], output_file: str, file_format: str,
+                 fieldnames: List[str] = SERVICE_FIELDNAMES):
     """
     Writes the detailed collected metrics data to the specified output file.
     """
@@ -266,16 +395,13 @@ def write_output(metrics_data: List[MetricEntry], output_file: str, file_format:
     try:
         with open(output_file, 'w', newline='', encoding='utf-8') as f:
             if file_format == 'csv':
-                fieldnames = [
-                    "commit_hash", "commit_summary", "commit_author_date", 
-                    "release_tag", "release_date", "lead_time_days", "service_name"
-                ]
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
                 writer.writeheader()
                 if metrics_data:
                     writer.writerows(metrics_data)
             elif file_format == 'json':
-                json.dump(metrics_data, f, indent=4, ensure_ascii=False)
+                projected = [{k: m.get(k) for k in fieldnames} for m in metrics_data]
+                json.dump(projected, f, indent=4, ensure_ascii=False)
         print(f"Detailed report successfully written to '{output_file}'")
     except IOError as e:
         print(f"Error writing to detailed output file '{output_file}': {e}", file=sys.stderr)
@@ -283,7 +409,8 @@ def write_output(metrics_data: List[MetricEntry], output_file: str, file_format:
         print(f"An unexpected error occurred while writing detailed output file '{output_file}': {e}", file=sys.stderr)
 
 
-def write_summary_report(summary_data: List[SummaryEntry], summary_output_file: str):
+def write_summary_report(summary_data: List[SummaryEntry], summary_output_file: str,
+                         group_field: str = "service_name"):
     """
     Writes the aggregated summary data to a CSV file.
     """
@@ -293,7 +420,7 @@ def write_summary_report(summary_data: List[SummaryEntry], summary_output_file: 
     print(f"Writing summary report to '{summary_output_file}'...")
     try:
         with open(summary_output_file, 'w', newline='', encoding='utf-8') as f:
-            fieldnames = ["year_month", "service_name", "average_lead_time_days", "release_count"]
+            fieldnames = ["year_month", group_field, "average_lead_time_days", "release_count"]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             if summary_data:
@@ -334,6 +461,42 @@ def main():
         help="Desired output format for the detailed report."
     )
     
+    parser.add_argument(
+        "--group-by",
+        choices=['service', 'team'],
+        default='service',
+        help=("Report per service (default) or per team. In 'team' mode a release counts for a "
+              "team when at least one of its members authored a commit in it, and only the "
+              "members' commits are used for lead time. Requires --teams-config.")
+    )
+    parser.add_argument(
+        "--teams-config",
+        type=str,
+        default=None,
+        help=("JSON file defining teams: "
+              '{"teams": {"team-name": ["member@example.com", "Member Name"]}}. '
+              "Members are matched on commit author email or name (case-insensitive).")
+    )
+
+    parser.add_argument(
+        "--cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=("Reuse per-tag results from previous runs. Cached entries are keyed by tag and "
+              "commit SHAs, so new tags are the only ones computed on later runs.")
+    )
+    parser.add_argument(
+        "--cache-file",
+        type=str,
+        default=DEFAULT_CACHE_FILE,
+        help="Path of the cache file."
+    )
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help="Discard the existing cache before running."
+    )
+
     # For Python 3.9+
     parser.add_argument(
         '--monorepo',
@@ -353,6 +516,14 @@ def main():
 
     args = parser.parse_args()
 
+    teams: Optional[Dict[str, List[str]]] = None
+    if args.group_by == 'team':
+        if not args.teams_config:
+            parser.error("--group-by team requires --teams-config")
+        teams = load_teams_config(args.teams_config)
+        if teams is None:
+            sys.exit(1)
+
     # Construct full output filename with extension based on format
     base_name_from_arg = args.output_file
     # Remove any user-supplied extension from the base name if they provided one,
@@ -361,6 +532,10 @@ def main():
     detailed_output_filename = f"{base_output_name}.{args.format}"
 
     abs_repo_path = os.path.abspath(args.repo_path)
+
+    if args.clear_cache and os.path.exists(args.cache_file):
+        os.remove(args.cache_file)
+        print(f"INFO: Removed cache '{args.cache_file}'.")
     
     print(f"Analyzing Git repository at: {abs_repo_path}")
     if args.monorepo:
@@ -368,17 +543,24 @@ def main():
     else:
         print("INFO: Monorepo mode is DISABLED.")
 
-    detailed_metrics_data = calculate_lead_time_metrics(abs_repo_path, args.monorepo)
-    write_output(detailed_metrics_data, detailed_output_filename, args.format)
+    detailed_metrics_data = calculate_lead_time_metrics(
+        abs_repo_path, args.monorepo, args.cache_file if args.cache else None)
+    group_field = "service_name"
+    output_fieldnames = SERVICE_FIELDNAMES
+    if teams is not None:
+        detailed_metrics_data = assign_metrics_to_teams(detailed_metrics_data, teams)
+        group_field = "team_name"
+        output_fieldnames = TEAM_FIELDNAMES
+    write_output(detailed_metrics_data, detailed_output_filename, args.format, output_fieldnames)
 
     if detailed_metrics_data:
         print(f"Generated {len(detailed_metrics_data)} detailed lead time entries.")
-        summary_data = generate_summary_data(detailed_metrics_data, args.monorepo)
+        summary_data = generate_summary_data(detailed_metrics_data, args.monorepo, group_field)
         
         summary_base_name, _ = os.path.splitext(detailed_output_filename) # Use base from detailed
         summary_output_filename = f"{summary_base_name}_summary.csv"
         
-        write_summary_report(summary_data, summary_output_filename)
+        write_summary_report(summary_data, summary_output_filename, group_field)
         if summary_data:
             print(f"Generated {len(summary_data)} summary entries.")
         else:
