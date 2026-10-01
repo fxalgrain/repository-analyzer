@@ -16,7 +16,8 @@ python dora_metrics.py --help
 python dora_metrics.py -r <repo_path>                       # monorepo mode (default) → dora.csv + dora_summary.csv
 python dora_metrics.py -r <repo_path> --no-monorepo         # single-service repo
 python dora_metrics.py -r <repo_path> -o out -f json        # → out.json + out_summary.csv (summary is always CSV)
-python dora_metrics.py --config teams.json [--group-by team]                      # repos + teams from a config (see teams.example.json); -r is repeatable
+python dora_metrics.py                                      # uses ./config.json if present: repos + teams, per-team report (see config.example.json)
+python dora_metrics.py --group-by service                   # same, but per service; -r is repeatable, --config PATH picks another file
 ```
 
 There is no test suite, linter, or build configuration. `dora.csv` / `dora_summary.csv` in the repo root are gitignored sample outputs from a real run, useful as a reference for output shape.
@@ -37,7 +38,7 @@ Pipeline in `main()`: `calculate_lead_time_metrics` → `write_output` (detailed
 
 ## Team mode
 
-`--group-by team --config <json>` (`--teams-config` is an alias) reuses the same tag/range/service-path pipeline, then `assign_metrics_to_teams` keeps only commits whose **author** (email or name, case-insensitive) is listed in a team, emitting one row per team (a person in several teams is counted in each). So a release counts for a team only if a member authored a commit in it, and lead time is averaged over the members' commits only. Detailed CSV gains `team_name`, `author_name`, `author_email`; the summary is grouped by (`YYYY-MM`, `repo_name`, `team_name`).
+With teams in the config (`./config.json` is auto-loaded, or `--config PATH`), `--group-by` defaults to `team` (`--group-by service` opts out); this mode reuses the same tag/range/service-path pipeline, then `assign_metrics_to_teams` keeps only commits whose **author** (email or name, case-insensitive) is listed in a team, emitting one row per team (a person in several teams is counted in each). So a release counts for a team only if a member authored a commit in it, and lead time is averaged over the members' commits only. Detailed CSV gains `team_name`, `author_name`, `author_email`; the summary is grouped by (`YYYY-MM`, `repo_name`, `team_name`).
 
 ## Multiple repositories
 

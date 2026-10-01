@@ -32,6 +32,7 @@ TEAM_FIELDNAMES = [
     "team_name", "author_name", "author_email"
 ]
 
+DEFAULT_CONFIG_FILE = "config.json"
 DEFAULT_CACHE_FILE = ".dora_cache.json"
 # Bump when the shape or semantics of cached entries change (e.g. path convention, new fields).
 CACHE_VERSION = 1
@@ -504,20 +505,21 @@ def main():
     parser.add_argument(
         "--group-by",
         choices=['service', 'team'],
-        default='service',
-        help=("Report per service (default) or per team. In 'team' mode a release counts for a "
+        default=None,
+        help=("Report per service or per team. Default: 'team' when the config defines teams, "
+              "else 'service'. In 'team' mode a release counts for a "
               "team when at least one of its members authored a commit in it, and only the "
               "members' commits are used for lead time. Requires teams in --config.")
     )
     parser.add_argument(
-        "--config", "--teams-config", dest="config",
+        "--config",
         type=str,
         default=None,
-        help=("JSON config file: "
+        help=(f"JSON config file (default: ./{DEFAULT_CONFIG_FILE} when it exists): "
               '{"teams": {"team-name": ["member@example.com", "Member Name"]}, '
               '"repositories": ["path", {"path": "...", "name": "...", "monorepo": false}]}. '
               "Team members are matched on commit author email or name (case-insensitive). "
-              "See teams.example.json.")
+              "See config.example.json.")
     )
 
     parser.add_argument(
@@ -560,15 +562,20 @@ def main():
 
     teams: Optional[Dict[str, List[str]]] = None
     config_repos: List[RepoSpec] = []
-    if args.config:
-        loaded = load_config(args.config)
+    config_path = args.config
+    if not config_path and os.path.isfile(DEFAULT_CONFIG_FILE):
+        config_path = DEFAULT_CONFIG_FILE
+        print(f"INFO: Using default config '{DEFAULT_CONFIG_FILE}'.")
+    if config_path:
+        loaded = load_config(config_path)
         if loaded is None:
             sys.exit(1)
         config_teams, config_repos = loaded
         teams = config_teams or None
-    if args.group_by == 'team' and not teams:
-        parser.error("--group-by team requires a non-empty 'teams' object in --config")
-    if args.group_by != 'team':
+    group_by = args.group_by or ('team' if teams else 'service')
+    if group_by == 'team' and not teams:
+        parser.error("--group-by team requires a non-empty 'teams' object in the config file")
+    if group_by != 'team':
         teams = None
 
     if args.repo_path:

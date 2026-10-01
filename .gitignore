@@ -2,4 +2,4 @@ venv
 dora.csv
 dora_summary.csv
 .dora_cache.json
-teams.json
+config.json

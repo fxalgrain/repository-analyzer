@@ -57,7 +57,7 @@ python dora_metrics.py --repo-path=<repo_path> [options]
 
 ### Reporting per team
 
-By default metrics are reported per service. To report per team instead, describe your teams in a JSON file (see `teams.example.json`):
+Without teams, metrics are reported per service. To report per team, describe your teams in a JSON file named `config.json` (see `config.example.json`). `config.json` in the current directory is picked up automatically and is gitignored; use `--config PATH` for another file:
 
 ```json
 {
@@ -71,7 +71,7 @@ By default metrics are reported per service. To report per team instead, describ
 Members are matched, case-insensitively, against the commit **author's** email or name. Then run:
 
 ```bash
-python dora_metrics.py -r <repo_path> --group-by team --config teams.json
+python dora_metrics.py -r <repo_path>      # config.json found → per-team report
 ```
 
 * A release counts for a team when at least one of its members authored a commit in it.
@@ -81,7 +81,7 @@ python dora_metrics.py -r <repo_path> --group-by team --config teams.json
 
 ### Several repositories
 
-Pass `-r` several times, or list the repositories in the config file (the same file as the teams, see `teams.example.json`):
+Pass `-r` several times, or list the repositories in the config file (the same file as the teams, see `config.example.json`):
 
 ```json
 {
@@ -94,8 +94,9 @@ Pass `-r` several times, or list the repositories in the config file (the same f
 ```
 
 ```bash
-python dora_metrics.py --config teams.json                    # service report over every listed repo
-python dora_metrics.py --config teams.json --group-by team    # team report over every listed repo
+python dora_metrics.py                                         # config.json: every listed repo, per team if it defines teams
+python dora_metrics.py --group-by service                      # same repos, per service instead
+python dora_metrics.py --config other.json                     # another config file
 python dora_metrics.py -r ../a -r ../b                        # without a config file
 ```
 
