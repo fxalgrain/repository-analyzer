@@ -110,6 +110,11 @@ python dora_metrics.py -r ../a -r ../b                        # without a config
 
 The config is validated before any repository is read. All problems are listed at once and the run exits with status 1: unknown keys (so a typo like `repository` is caught), wrong types, teams without members, an invalid `since`, and repository paths that do not exist or are not Git repositories. Repositories passed with `-r` are checked the same way.
 
+Each repository is then checked against the pattern its mode expects (`validate_repository_pattern`), again before any analysis starts:
+
+* **Errors (exit 1):** no annotated tag with a date; in monorepo mode, no tag named `{service}/{version}`, or no `services/{service}/` directory at the latest tag of any service (every commit would be filtered out).
+* **Warnings:** shallow clone (truncated lead times); in monorepo mode, tags that do not match `{service}/{version}` (ignored) or services with no `services/{service}/` directory at their latest tag; without monorepo mode, every tag looking like `{service}/{version}` (probably a monorepo).
+
 ### Faster runs
 
 * `--since 2025-01-01` (or a relative age: `1y`, `6m`, `8w`, `90d`) keeps only releases whose **tag date** is on or after the cutoff. It filters on release date, not commit date, so every kept release has exactly the same commits and lead times as in a full run (a commit-date cutoff would drop the longest-waiting commits). Older tags are skipped without walking their commits. It can also be set once in the config: `"since": "1y"`; the flag wins.

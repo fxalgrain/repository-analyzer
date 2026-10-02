@@ -46,7 +46,7 @@ With teams in the config (`./config.json` is auto-loaded, or `--config PATH`), `
 
 ## Config validation
 
-`load_config` validates everything up front and prints *all* errors before exiting 1: unknown keys (top level and per repository), types, empty teams, `since` via `parse_since`, and repository paths via `check_repositories` (also applied in `main()` to `-r`/cwd repositories). Keep `CONFIG_KEYS`/`REPO_KEYS` in sync when adding options.
+`load_config` validates everything up front and prints *all* errors before exiting 1: unknown keys (top level and per repository), types, empty teams, `since` via `parse_since`, and repository paths via `check_repositories` (also applied in `main()` to `-r`/cwd repositories). Keep `CONFIG_KEYS`/`REPO_KEYS` in sync when adding options. Then `validate_repository_pattern(path, is_monorepo)` checks each repo against its mode's expectations (annotated tags, `{service}/{version}` tags and the hardcoded `services/{service}/` path at each service's latest tag, shallow clone) and `main()` aborts with all errors listed before analysing anything; update it if the tag or path convention changes.
 
 ## Speed options
 

@@ -433,6 +433,68 @@ def load_config(config_path: str) -> Optional[Tuple[Dict[str, List[str]], List[R
     return teams, repos, since
 
 
+def validate_repository_pattern(repo_path: str, is_monorepo: bool) -> Tuple[List[str], List[str]]:
+    """
+    Checks that a repository has what the analysis expects. Returns (errors, warnings):
+    errors mean the run would produce nothing useful for this repository.
+    - Both modes: at least one annotated tag with a usable date; warns on shallow clones
+      (missing history gives truncated lead times).
+    - Monorepo mode: at least one tag named '{service}/{version}', and 'services/{service}/' present
+      in the latest tag of at least one such service (otherwise every commit is filtered out).
+    - Single-repo mode: warns when every tag looks like '{service}/{version}' (probably a monorepo).
+    """
+    errors: List[str] = []
+    warnings: List[str] = []
+    try:
+        repo = git.Repo(repo_path, search_parent_directories=True)
+        tags = get_annotated_tags_sorted(repo)
+        shallow = repo.git.rev_parse("--is-shallow-repository").strip() == "true"
+    except Exception as e:
+        return [f"cannot be inspected: {e}"], warnings
+
+    if shallow:
+        warnings.append("shallow clone: older commits are missing, so lead times may be truncated "
+                        "(run 'git fetch --unshallow')")
+    if not tags:
+        errors.append("no annotated tags with a date (lightweight tags are ignored); "
+                      "release dates come from annotated tags")
+        return errors, warnings
+
+    parsed = [(tag, parse_monorepo_tag(tag.name)) for tag in tags]
+    service_tags = [(tag, parts[0]) for tag, parts in parsed if parts]
+    if not is_monorepo:
+        if len(service_tags) == len(tags):
+            warnings.append("every tag looks like '{service}/{version}': is this a monorepo? "
+                            "(set \"monorepo\": true in the config or drop --no-monorepo)")
+        return errors, warnings
+
+    ignored = len(tags) - len(service_tags)
+    if not service_tags:
+        errors.append(f"monorepo mode: none of the {len(tags)} annotated tags matches "
+                      "'{service}/{version}' (use \"monorepo\": false or --no-monorepo for a single-service repo)")
+        return errors, warnings
+    if ignored:
+        warnings.append(f"{ignored} of {len(tags)} annotated tags do not match '{{service}}/{{version}}' "
+                        "and will be ignored")
+
+    latest_tag_of_service: Dict[str, git.TagReference] = {}
+    for tag, service in service_tags:  # tags are sorted oldest to newest
+        latest_tag_of_service[service] = tag
+    missing: List[str] = []
+    for service, tag in latest_tag_of_service.items():
+        try:
+            tag.commit.tree / f"services/{service}"
+        except KeyError:
+            missing.append(service)
+    if len(missing) == len(latest_tag_of_service):
+        errors.append("monorepo mode: no 'services/{service}/' directory exists at the latest tag of any "
+                      f"service ({', '.join(sorted(missing))}); every commit would be filtered out")
+    elif missing:
+        warnings.append("no 'services/{service}/' directory at the latest tag of: "
+                        f"{', '.join(sorted(missing))} (their releases will have no commits)")
+    return errors, warnings
+
+
 def check_repositories(specs: List[RepoSpec], where_prefix: str = "repository") -> List[str]:
     """Returns one message per repository whose path is missing or is not inside a Git repository."""
     errors: List[str] = []
@@ -715,6 +777,19 @@ def main():
                 print(f"  - {error}", file=sys.stderr)
             sys.exit(1)
     repo_names = unique_repo_names(repo_specs)
+
+    pattern_errors: List[str] = []
+    for spec, repo_name in zip(repo_specs, repo_names):
+        spec_monorepo = args.monorepo if spec.get("monorepo") is None else spec["monorepo"]
+        errors, warnings = validate_repository_pattern(spec["path"], spec_monorepo)
+        for warning in warnings:
+            print(f"Warning: [{repo_name}] {warning}", file=sys.stderr)
+        pattern_errors.extend(f"[{repo_name}] {error}" for error in errors)
+    if pattern_errors:
+        print("Error: some repositories do not match the expected pattern:", file=sys.stderr)
+        for error in pattern_errors:
+            print(f"  - {error}", file=sys.stderr)
+        sys.exit(1)
 
     since: Optional[datetime] = None
     since_raw = args.since or config_since
