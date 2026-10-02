@@ -38,7 +38,8 @@ TEAM_FIELDNAMES = [
 DEFAULT_CONFIG_FILE = "config.json"
 DEFAULT_CACHE_FILE = ".dora_cache.json"
 # Bump when the shape or semantics of cached entries change (e.g. path convention, new fields).
-CACHE_VERSION = 1
+CACHE_VERSION = 2
+DEFAULT_SERVICE_PATH = "services/{service}"
 
 Cache = Dict[str, Any]
 
@@ -72,36 +73,49 @@ def save_cache(cache: Cache, cache_path: str) -> None:
         print(f"Warning: Could not write cache '{cache_path}': {e}", file=sys.stderr)
 
 
+def service_path_prefix(service_path: str, service_name: str) -> str:
+    """Directory prefix of a service, e.g. 'services/{service}' + 'billing' -> 'services/billing/'."""
+    return service_path.replace("{service}", service_name).strip("/") + "/"
+
+
+def check_service_path(value: Any) -> Optional[str]:
+    """Returns an error message when `value` is not a usable service path pattern, else None."""
+    if not isinstance(value, str) or "{service}" not in value or not value.strip("/ "):
+        return "'service_path' must be a string containing '{service}', e.g. \"services/{service}\""
+    return None
+
+
 def make_cache_key(repo_path: str, tag_name: str, tag_timestamp: int, rev_spec: str,
-                   service_name: Optional[str], grep_pattern: str) -> str:
+                   service_name: Optional[str], grep_pattern: str, service_path: str) -> str:
     """
     Everything a tag's entries depend on. rev_spec holds the commit SHAs, so a moved or
     re-created tag, or rewritten history, yields a different key instead of stale data.
     """
     return "|".join([repo_path, tag_name, str(tag_timestamp), rev_spec,
-                     service_name or "", grep_pattern])
+                     service_name or "", grep_pattern, service_path if service_name else ""])
 
 
 def collect_tag_entries(repo: git.Repo, rev_spec: str, grep_pattern: str,
                         release_datetime: datetime, tag_name: str,
-                        service_name: Optional[str]) -> List[MetricEntry]:
+                        service_name: Optional[str],
+                        service_path: str = DEFAULT_SERVICE_PATH) -> List[MetricEntry]:
     """
     Computes the metric entries for one tag's commit range. When service_name is set,
-    only commits touching 'services/{service_name}/' are kept.
+    only commits touching the service's directory (service_path with {service} replaced) are kept.
     """
     entries: List[MetricEntry] = []
     for commit in repo.iter_commits(rev=rev_spec, no_merges=True, invert_grep=True, grep=grep_pattern):
         if service_name:
             is_relevant_to_service = False
-            service_path_prefix = f"services/{service_name}/"
+            prefix = service_path_prefix(service_path, service_name)
             if not commit.parents:
                 for item in commit.tree.traverse(): # type: ignore
-                    if item.type == 'blob' and item.path.startswith(service_path_prefix):
+                    if item.type == 'blob' and item.path.startswith(prefix):
                         is_relevant_to_service = True
                         break
             else:
                 for file_path in commit.stats.files.keys():
-                    if file_path.startswith(service_path_prefix):
+                    if file_path.startswith(prefix):
                         is_relevant_to_service = True
                         break
             if not is_relevant_to_service:
@@ -199,7 +213,8 @@ def parse_since(value: str, now: Optional[datetime] = None) -> datetime:
 def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool,
                                 cache: Optional[Cache] = None,
                                 repo_name: Optional[str] = None,
-                                since: Optional[datetime] = None) -> List[MetricEntry]:
+                                since: Optional[datetime] = None,
+                                service_path: str = DEFAULT_SERVICE_PATH) -> List[MetricEntry]:
     """
     Calculates Lead Time for Change for one repository. Every entry is labelled with repo_name
     (kept out of the cache, so renaming a repository in the config never serves stale labels).
@@ -209,7 +224,7 @@ def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool,
     - Uses repo.iter_commits with no_merges=True and invert_grep=True for filtering.
     - If is_monorepo:
         - Tracks previous tag commit per service.
-        - Filters commits based on paths like "services/{service_name}/...".
+        - Filters commits on the service directory given by `service_path` (default "services/{service}").
     """
     log = make_logger(f"[{repo_name or os.path.basename(os.path.normpath(repo_path))}]")
     try:
@@ -245,8 +260,8 @@ def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool,
 
     log(f"Processing {len(sorted_annotated_tags)} annotated tags...")
     if is_monorepo:
-        log("INFO: Monorepo mode active. Tags expected: '{service}/{version}'. "
-              "Commit ranges and paths will be service-specific (e.g., 'services/{service_name}/...').")
+        log(f"INFO: Monorepo mode active. Tags expected: '{{service}}/{{version}}'. "
+              f"Commit ranges and paths will be service-specific (path pattern: '{service_path}').")
 
     for i, current_tag_ref in enumerate(sorted_annotated_tags):
         current_tag_object = current_tag_ref.tag
@@ -287,7 +302,8 @@ def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool,
             continue
 
         cache_key = make_cache_key(repo_path, current_tag_ref.name, release_timestamp,
-                                   rev_spec, service_name_for_tag, release_commit_grep_pattern)
+                                   rev_spec, service_name_for_tag, release_commit_grep_pattern,
+                                   service_path)
         tag_entries: Optional[List[MetricEntry]] = cache["entries"].get(cache_key) if cache else None
         if tag_entries is not None:
             cache_hits += 1
@@ -295,7 +311,7 @@ def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool,
             try:
                 tag_entries = collect_tag_entries(repo, rev_spec, release_commit_grep_pattern,
                                                   release_datetime, current_tag_ref.name,
-                                                  service_name_for_tag)
+                                                  service_name_for_tag, service_path)
             except git.exc.GitCommandError as e:
                 log(f"Warning: Could not retrieve and filter commits for range '{rev_spec}' "
                       f"(tag '{current_tag_ref.name}'). Error: {e}. Skipping this tag's new commits.", file=sys.stderr)
@@ -338,11 +354,11 @@ def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool,
     return all_metrics
 
 
-RepoSpec = Dict[str, Any]  # {"path": str, "name": Optional[str], "monorepo": Optional[bool]}
+RepoSpec = Dict[str, Any]  # {"path", "name", "monorepo", "service_path"}: the last three Optional (None = default)
 
 
 CONFIG_KEYS = {"teams", "repositories", "since"}
-REPO_KEYS = {"path", "name", "monorepo"}
+REPO_KEYS = {"path", "name", "monorepo", "service_path"}
 
 
 def load_config(config_path: str) -> Optional[Tuple[Dict[str, List[str]], List[RepoSpec], Optional[str]]]:
@@ -350,7 +366,7 @@ def load_config(config_path: str) -> Optional[Tuple[Dict[str, List[str]], List[R
     Loads and validates the JSON config file:
       {
         "teams": {"team-name": ["email-or-name", ...]},                       (optional)
-        "repositories": ["path", {"path": "...", "name": "...", "monorepo": false}],   (optional)
+        "repositories": ["path", {"path": "...", "name": "...", "monorepo": false, "service_path": "services/{service}"}],   (optional)
         "since": "1y"                                                          (optional, see --since)
       }
     Team members are matched case-insensitively against the commit author's email or name.
@@ -408,10 +424,13 @@ def load_config(config_path: str) -> Optional[Tuple[Dict[str, List[str]], List[R
             errors.append(f"{where}: 'name' must be a non-empty string")
         if "monorepo" in spec and not isinstance(spec["monorepo"], bool):
             errors.append(f"{where}: 'monorepo' must be true or false")
+        if "service_path" in spec and (message := check_service_path(spec["service_path"])):
+            errors.append(f"{where}: {message}")
         repos.append({
             "path": os.path.normpath(os.path.join(base_dir, os.path.expanduser(spec["path"]))),
             "name": spec["name"].strip() if isinstance(spec.get("name"), str) and spec["name"].strip() else None,
             "monorepo": spec["monorepo"] if isinstance(spec.get("monorepo"), bool) else None,
+            "service_path": spec["service_path"] if isinstance(spec.get("service_path"), str) else None,
         })
     errors.extend(check_repositories(repos, where_prefix="repositories"))
 
@@ -433,13 +452,14 @@ def load_config(config_path: str) -> Optional[Tuple[Dict[str, List[str]], List[R
     return teams, repos, since
 
 
-def validate_repository_pattern(repo_path: str, is_monorepo: bool) -> Tuple[List[str], List[str]]:
+def validate_repository_pattern(repo_path: str, is_monorepo: bool,
+                                service_path: str = DEFAULT_SERVICE_PATH) -> Tuple[List[str], List[str]]:
     """
     Checks that a repository has what the analysis expects. Returns (errors, warnings):
     errors mean the run would produce nothing useful for this repository.
     - Both modes: at least one annotated tag with a usable date; warns on shallow clones
       (missing history gives truncated lead times).
-    - Monorepo mode: at least one tag named '{service}/{version}', and 'services/{service}/' present
+    - Monorepo mode: at least one tag named '{service}/{version}', and the service directory ({service_path}) present
       in the latest tag of at least one such service (otherwise every commit is filtered out).
     - Single-repo mode: warns when every tag looks like '{service}/{version}' (probably a monorepo).
     """
@@ -483,14 +503,14 @@ def validate_repository_pattern(repo_path: str, is_monorepo: bool) -> Tuple[List
     missing: List[str] = []
     for service, tag in latest_tag_of_service.items():
         try:
-            tag.commit.tree / f"services/{service}"
+            tag.commit.tree / service_path_prefix(service_path, service).rstrip("/")
         except KeyError:
             missing.append(service)
     if len(missing) == len(latest_tag_of_service):
-        errors.append("monorepo mode: no 'services/{service}/' directory exists at the latest tag of any "
+        errors.append(f"monorepo mode: no '{service_path}' directory exists at the latest tag of any "
                       f"service ({', '.join(sorted(missing))}); every commit would be filtered out")
     elif missing:
-        warnings.append("no 'services/{service}/' directory at the latest tag of: "
+        warnings.append(f"no '{service_path}' directory at the latest tag of: "
                         f"{', '.join(sorted(missing))} (their releases will have no commits)")
     return errors, warnings
 
@@ -685,7 +705,7 @@ def main():
         default=None,
         help=(f"JSON config file (default: ./{DEFAULT_CONFIG_FILE} when it exists): "
               '{"teams": {"team-name": ["member@example.com", "Member Name"]}, '
-              '"repositories": ["path", {"path": "...", "name": "...", "monorepo": false}]}. '
+              '"repositories": ["path", {"path": "...", "name": "...", "monorepo": false, "service_path": "..."}]}. '
               "Team members are matched on commit author email or name (case-insensitive). "
               "See config.example.json.")
     )
@@ -701,8 +721,15 @@ def main():
     parser.add_argument(
         "-j", "--jobs",
         type=int,
-        default=4,
-        help="Number of repositories analysed in parallel."
+        default=None,
+        help="Number of repositories analysed in parallel (default: one per repository)."
+    )
+    parser.add_argument(
+        "--service-path",
+        type=str,
+        default=DEFAULT_SERVICE_PATH,
+        help=("Monorepo directory of a service, '{service}' being replaced by its name "
+              f"(default: {DEFAULT_SERVICE_PATH}). Can be set per repository as \"service_path\" in the config.")
     )
     parser.add_argument(
         "--cache",
@@ -762,12 +789,12 @@ def main():
         teams = None
 
     if args.repo_path:
-        repo_specs: List[RepoSpec] = [{"path": os.path.abspath(p), "name": None, "monorepo": None}
+        repo_specs: List[RepoSpec] = [{"path": os.path.abspath(p), "name": None, "monorepo": None, "service_path": None}
                                       for p in args.repo_path]
     elif config_repos:
         repo_specs = config_repos
     else:
-        repo_specs = [{"path": os.path.abspath("."), "name": None, "monorepo": None}]
+        repo_specs = [{"path": os.path.abspath("."), "name": None, "monorepo": None, "service_path": None}]
     if args.repo_path or not config_repos:
         # repositories listed in the config were already checked by load_config
         repo_errors = check_repositories(repo_specs)
@@ -778,10 +805,17 @@ def main():
             sys.exit(1)
     repo_names = unique_repo_names(repo_specs)
 
+    if message := check_service_path(args.service_path):
+        parser.error(message.replace("'service_path'", "--service-path"))
+    jobs = args.jobs or len(repo_specs)
+
+    def service_path_of(spec: RepoSpec) -> str:
+        return spec.get("service_path") or args.service_path
+
     pattern_errors: List[str] = []
     for spec, repo_name in zip(repo_specs, repo_names):
         spec_monorepo = args.monorepo if spec.get("monorepo") is None else spec["monorepo"]
-        errors, warnings = validate_repository_pattern(spec["path"], spec_monorepo)
+        errors, warnings = validate_repository_pattern(spec["path"], spec_monorepo, service_path_of(spec))
         for warning in warnings:
             print(f"Warning: [{repo_name}] {warning}", file=sys.stderr)
         pattern_errors.extend(f"[{repo_name}] {error}" for error in errors)
@@ -799,8 +833,9 @@ def main():
         except ValueError as e:
             parser.error(str(e))
         print(f"INFO: Only releases on or after {since.date()} are analysed.")
-    if args.jobs < 1:
+    if args.jobs is not None and args.jobs < 1:
         parser.error("--jobs must be at least 1")
+    jobs = args.jobs or len(repo_specs)
 
     # Construct full output filename with extension based on format
     base_name_from_arg = args.output_file
@@ -821,12 +856,13 @@ def main():
         is_monorepo = args.monorepo if spec.get("monorepo") is None else spec["monorepo"]
         print(f"Analyzing Git repository '{repo_name}' at: {spec['path']} "
               f"(monorepo mode {'ENABLED' if is_monorepo else 'DISABLED'})")
-        return calculate_lead_time_metrics(spec["path"], is_monorepo, cache, repo_name, since)
+        return calculate_lead_time_metrics(spec["path"], is_monorepo, cache, repo_name, since,
+                                       service_path_of(spec))
 
     # Repositories are independent and the work is git-subprocess bound, so threads are enough.
     # map() keeps the config order, so the reports are identical whatever --jobs is.
     detailed_metrics_data: List[MetricEntry] = []
-    with ThreadPoolExecutor(max_workers=min(args.jobs, len(repo_specs))) as pool:
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
         for repo_metrics in pool.map(analyse, zip(repo_specs, repo_names)):
             detailed_metrics_data.extend(repo_metrics)
 

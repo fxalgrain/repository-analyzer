@@ -32,7 +32,7 @@ Pipeline in `main()`: `calculate_lead_time_metrics` → `write_output` (detailed
 - **Monorepo mode** (default, `--monorepo`/`--no-monorepo` via `argparse.BooleanOptionalAction`, so Python 3.9+ is actually required despite the README saying 3.7+):
   - Tags must be `{service}/{version}`; non-matching tags are skipped with a warning.
   - The previous-tag pointer is tracked per service.
-  - A commit counts for a service only if it touches a path under `services/{service}/` (root commits are checked by traversing the tree). This path convention is hardcoded.
+  - A commit counts for a service only if it touches a path under the service directory (root commits are checked by traversing the tree). That directory is the per-repo `service_path` pattern (`{service}` placeholder, default `DEFAULT_SERVICE_PATH` = `services/{service}`; `--service-path` sets the default, the config key overrides it per repo).
 - **Lead time** = tag date − `commit.committed_datetime` (committer date, even though the output column is named `commit_author_date`), in fractional days.
 - **Summary**: grouped by (`YYYY-MM` of release date, repo, service); `average_lead_time_days` is the mean over commits (rounded to 4 decimals), `release_count` is the number of distinct tags, `commit_count` the number of commits. In non-monorepo mode the service name is `_overall_`.
 
@@ -46,15 +46,15 @@ With teams in the config (`./config.json` is auto-loaded, or `--config PATH`), `
 
 ## Config validation
 
-`load_config` validates everything up front and prints *all* errors before exiting 1: unknown keys (top level and per repository), types, empty teams, `since` via `parse_since`, and repository paths via `check_repositories` (also applied in `main()` to `-r`/cwd repositories). Keep `CONFIG_KEYS`/`REPO_KEYS` in sync when adding options. Then `validate_repository_pattern(path, is_monorepo)` checks each repo against its mode's expectations (annotated tags, `{service}/{version}` tags and the hardcoded `services/{service}/` path at each service's latest tag, shallow clone) and `main()` aborts with all errors listed before analysing anything; update it if the tag or path convention changes.
+`load_config` validates everything up front and prints *all* errors before exiting 1: unknown keys (top level and per repository), types, empty teams, `since` via `parse_since`, and repository paths via `check_repositories` (also applied in `main()` to `-r`/cwd repositories). Keep `CONFIG_KEYS`/`REPO_KEYS` in sync (`service_path` is checked by `check_service_path`) when adding options. Then `validate_repository_pattern(path, is_monorepo, service_path)` checks each repo against its mode's expectations (annotated tags, `{service}/{version}` tags and the service directory pattern at each service's latest tag, shallow clone) and `main()` aborts with all errors listed before analysing anything; update it if the tag or path convention changes.
 
 ## Speed options
 
-`--since` (or `"since"` in the config; `parse_since` accepts `YYYY-MM-DD` or `Ny/Nm/Nw/Nd`) skips tags whose **release date** is before the cutoff. The skip happens in `calculate_lead_time_metrics` *after* the range is built and the previous-tag pointers are advanced, so the first in-window tag keeps its full-run range (never filter by commit date: it would drop the longest lead times). `--jobs` runs `calculate_lead_time_metrics` per repo in a `ThreadPoolExecutor` (`map` keeps config order, so output does not depend on it); each repo logs through `make_logger` with a `[repo]` prefix. The shared cache dict is written by distinct keys per repo, which is safe under the GIL.
+`--since` (or `"since"` in the config; `parse_since` accepts `YYYY-MM-DD` or `Ny/Nm/Nw/Nd`) skips tags whose **release date** is before the cutoff. The skip happens in `calculate_lead_time_metrics` *after* the range is built and the previous-tag pointers are advanced, so the first in-window tag keeps its full-run range (never filter by commit date: it would drop the longest lead times). `--jobs` (default: one per repository) runs `calculate_lead_time_metrics` per repo in a `ThreadPoolExecutor` (`map` keeps config order, so output does not depend on it); each repo logs through `make_logger` with a `[repo]` prefix. The shared cache dict is written by distinct keys per repo, which is safe under the GIL.
 
 ## Cache
 
-`calculate_lead_time_metrics` caches the entries of each tag range in `.dora_cache.json`, one file shared by all repos and loaded/saved once by `main()` (`--cache/--no-cache`, `--cache-file`, `--clear-cache`). The key (`make_cache_key`) is repo path + tag name + tag date + `rev_spec` (commit SHAs) + service + grep pattern, so immutable git data never goes stale. The cache stores pre-team-filter entries. Bump `CACHE_VERSION` whenever the entry shape or the commit-selection logic (e.g. the `services/{service}/` convention) changes, otherwise old entries will be served.
+`calculate_lead_time_metrics` caches the entries of each tag range in `.dora_cache.json`, one file shared by all repos and loaded/saved once by `main()` (`--cache/--no-cache`, `--cache-file`, `--clear-cache`). The key (`make_cache_key`) is repo path + tag name + tag date + `rev_spec` (commit SHAs) + service + grep pattern + service path, so immutable git data never goes stale. The cache stores pre-team-filter entries. Bump `CACHE_VERSION` whenever the entry shape or the commit-selection logic (e.g. the `service_path` handling) changes, otherwise old entries will be served.
 
 ## Conventions
 

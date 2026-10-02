@@ -102,7 +102,7 @@ python dora_metrics.py -r ../a -r ../b                        # without a config
 ```
 
 * Relative paths in the config are resolved against the config file's directory; `~` is expanded. `-r` takes precedence over the config's `repositories`.
-* `name` (default: directory name) is the `repo_name` in the output; duplicates get a numeric suffix. `monorepo` overrides `--monorepo` for that repository.
+* `name` (default: directory name) is the `repo_name` in the output; duplicates get a numeric suffix. `monorepo` overrides `--monorepo` for that repository. `service_path` (default `services/{service}`, or `--service-path`) is the directory of a service in a monorepo, `{service}` being replaced by the tag's service name.
 * Both reports gain a `repo_name` column, and the summary is grouped by month, repository and service/team. Non-monorepo repositories appear as `_overall_`.
 * The cache is shared by all repositories (the repository path is part of each key).
 
@@ -112,13 +112,13 @@ The config is validated before any repository is read. All problems are listed a
 
 Each repository is then checked against the pattern its mode expects (`validate_repository_pattern`), again before any analysis starts:
 
-* **Errors (exit 1):** no annotated tag with a date; in monorepo mode, no tag named `{service}/{version}`, or no `services/{service}/` directory at the latest tag of any service (every commit would be filtered out).
-* **Warnings:** shallow clone (truncated lead times); in monorepo mode, tags that do not match `{service}/{version}` (ignored) or services with no `services/{service}/` directory at their latest tag; without monorepo mode, every tag looking like `{service}/{version}` (probably a monorepo).
+* **Errors (exit 1):** no annotated tag with a date; in monorepo mode, no tag named `{service}/{version}`, or no service directory (`services/{service}` by default, see `service_path`) at the latest tag of any service (every commit would be filtered out).
+* **Warnings:** shallow clone (truncated lead times); in monorepo mode, tags that do not match `{service}/{version}` (ignored) or services with no service directory at their latest tag; without monorepo mode, every tag looking like `{service}/{version}` (probably a monorepo).
 
 ### Faster runs
 
 * `--since 2025-01-01` (or a relative age: `1y`, `6m`, `8w`, `90d`) keeps only releases whose **tag date** is on or after the cutoff. It filters on release date, not commit date, so every kept release has exactly the same commits and lead times as in a full run (a commit-date cutoff would drop the longest-waiting commits). Older tags are skipped without walking their commits. It can also be set once in the config: `"since": "1y"`; the flag wins.
-* `-j N` / `--jobs N` (default 4) analyses N repositories at the same time. Output is identical whatever N is; log lines are prefixed with `[repo]`.
+* `-j N` / `--jobs N` (default: one per repository) analyses N repositories at the same time. Output is identical whatever N is; log lines are prefixed with `[repo]`.
 * The cache still applies: tags already cached are reused, and widening `--since` later only computes the newly included tags.
 
 ### HTML report
