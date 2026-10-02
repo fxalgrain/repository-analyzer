@@ -4,9 +4,12 @@
 import argparse
 import csv
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
+import re
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Any, Optional, Iterable, Tuple
 from collections import defaultdict # For easier aggregation
 
@@ -158,35 +161,74 @@ def parse_monorepo_tag(tag_name: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+_log_lock = threading.Lock()
+
+
+def make_logger(prefix: str):
+    """print() replacement that tags lines with the repository and stays readable across threads."""
+    def log(*args: Any, **kwargs: Any) -> None:
+        with _log_lock:
+            print(prefix, *args, **kwargs)
+    return log
+
+
+def parse_since(value: str, now: Optional[datetime] = None) -> datetime:
+    """
+    Parses --since: an ISO date ('2025-01-01') or a relative age ('1y', '6m', '8w', '90d')
+    counted back from now. Returns a UTC datetime. Raises ValueError on anything else.
+    """
+    now = now or datetime.now(timezone.utc)
+    value = value.strip()
+    match = re.fullmatch(r"(\d+)([ymwd])", value.lower())
+    if match:
+        amount, unit = int(match.group(1)), match.group(2)
+        if unit in "wd":
+            return now - timedelta(days=amount * (7 if unit == "w" else 1))
+        months = amount * (12 if unit == "y" else 1)
+        index = now.year * 12 + (now.month - 1) - months
+        year, month = divmod(index, 12)
+        month += 1
+        last_day = (datetime(year + (month == 12), month % 12 + 1, 1) - timedelta(days=1)).day
+        return now.replace(year=year, month=month, day=min(now.day, last_day))
+    try:
+        return datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise ValueError(f"invalid --since value '{value}': use YYYY-MM-DD or a relative age such as 1y, 6m, 8w, 90d")
+
+
 def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool,
                                 cache: Optional[Cache] = None,
-                                repo_name: Optional[str] = None) -> List[MetricEntry]:
+                                repo_name: Optional[str] = None,
+                                since: Optional[datetime] = None) -> List[MetricEntry]:
     """
     Calculates Lead Time for Change for one repository. Every entry is labelled with repo_name
     (kept out of the cache, so renaming a repository in the config never serves stale labels).
     New entries are added to `cache` in place; the caller persists it.
+    Releases tagged before `since` are skipped (not computed), but still advance the previous-tag
+    pointers, so the first release inside the window gets the same commit range as in a full run.
     - Uses repo.iter_commits with no_merges=True and invert_grep=True for filtering.
     - If is_monorepo:
         - Tracks previous tag commit per service.
         - Filters commits based on paths like "services/{service_name}/...".
     """
+    log = make_logger(f"[{repo_name or os.path.basename(os.path.normpath(repo_path))}]")
     try:
         repo = git.Repo(repo_path, search_parent_directories=True)
     except git.exc.InvalidGitRepositoryError:
-        print(f"Error: '{repo_path}' is not a valid Git repository or a '.git' "
+        log(f"Error: '{repo_path}' is not a valid Git repository or a '.git' "
               "directory was not found in its path or parent directories.", file=sys.stderr)
         return []
     except git.exc.NoSuchPathError:
-        print(f"Error: Repository path '{repo_path}' does not exist.", file=sys.stderr)
+        log(f"Error: Repository path '{repo_path}' does not exist.", file=sys.stderr)
         return []
     except Exception as e:
-        print(f"Error initializing Git repository at '{repo_path}': {e}", file=sys.stderr)
+        log(f"Error initializing Git repository at '{repo_path}': {e}", file=sys.stderr)
         return []
 
     sorted_annotated_tags = get_annotated_tags_sorted(repo)
 
     if not sorted_annotated_tags:
-        print("No suitable annotated tags found (or tags lack 'tagged_date' info). "
+        log("No suitable annotated tags found (or tags lack 'tagged_date' info). "
               "Cannot calculate Lead Time for Change.", file=sys.stderr)
         return []
 
@@ -195,14 +237,15 @@ def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool,
     global_previous_tag_commit_sha: Optional[str] = None
     repo_name = repo_name or os.path.basename(os.path.normpath(repo_path))
     cache_hits = 0
+    skipped_before_since = 0
 
     release_commit_grep_pattern = r"chore(.*): release .*"
-    print(f"INFO: Commits will be filtered using iter_commits with no_merges=True "
+    log(f"INFO: Commits will be filtered using iter_commits with no_merges=True "
           f"and excluding messages matching (via invert_grep): '{release_commit_grep_pattern}'")
 
-    print(f"Processing {len(sorted_annotated_tags)} annotated tags...")
+    log(f"Processing {len(sorted_annotated_tags)} annotated tags...")
     if is_monorepo:
-        print("INFO: Monorepo mode active. Tags expected: '{service}/{version}'. "
+        log("INFO: Monorepo mode active. Tags expected: '{service}/{version}'. "
               "Commit ranges and paths will be service-specific (e.g., 'services/{service_name}/...').")
 
     for i, current_tag_ref in enumerate(sorted_annotated_tags):
@@ -219,14 +262,14 @@ def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool,
             parsed_tag = parse_monorepo_tag(current_tag_ref.name)
             if parsed_tag:
                 service_name_for_tag, _ = parsed_tag
-                # print(f"  Processing monorepo tag: '{current_tag_ref.name}' for service: '{service_name_for_tag}'") # Verbose
+                # log(f"  Processing monorepo tag: '{current_tag_ref.name}' for service: '{service_name_for_tag}'") # Verbose
                 prev_service_commit_sha = previous_tag_commits_per_service.get(service_name_for_tag)
                 if prev_service_commit_sha:
                     rev_spec = f"{prev_service_commit_sha}..{current_release_commit_hexsha}"
                 else:
                     rev_spec = current_release_commit_hexsha
             else:
-                print(f"  Warning: Tag '{current_tag_ref.name}' does not match monorepo pattern "
+                log(f"  Warning: Tag '{current_tag_ref.name}' does not match monorepo pattern "
                       "'{service}/{version}'. Skipping this tag's processing in monorepo mode.", file=sys.stderr)
                 continue 
         else:
@@ -235,6 +278,14 @@ def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool,
             else:
                 rev_spec = current_release_commit_hexsha
         
+        if since and release_datetime < since:
+            skipped_before_since += 1
+            if is_monorepo and service_name_for_tag:
+                previous_tag_commits_per_service[service_name_for_tag] = current_release_commit_hexsha
+            elif not is_monorepo:
+                global_previous_tag_commit_sha = current_release_commit_hexsha
+            continue
+
         cache_key = make_cache_key(repo_path, current_tag_ref.name, release_timestamp,
                                    rev_spec, service_name_for_tag, release_commit_grep_pattern)
         tag_entries: Optional[List[MetricEntry]] = cache["entries"].get(cache_key) if cache else None
@@ -246,7 +297,7 @@ def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool,
                                                   release_datetime, current_tag_ref.name,
                                                   service_name_for_tag)
             except git.exc.GitCommandError as e:
-                print(f"Warning: Could not retrieve and filter commits for range '{rev_spec}' "
+                log(f"Warning: Could not retrieve and filter commits for range '{rev_spec}' "
                       f"(tag '{current_tag_ref.name}'). Error: {e}. Skipping this tag's new commits.", file=sys.stderr)
                 if is_monorepo and service_name_for_tag:
                     previous_tag_commits_per_service[service_name_for_tag] = current_release_commit_hexsha
@@ -264,14 +315,14 @@ def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool,
             tag_label += f" (Service: {service_name_for_tag})"
 
         if commits_processed_for_this_tag > 0:
-             print(f"  {tag_label} (Release Date: "
+             log(f"  {tag_label} (Release Date: "
                    f"{release_datetime.strftime('%Y-%m-%d %H:%M:%S %Z')}): "
                    f"Processed {commits_processed_for_this_tag} relevant commits.")
         elif (not is_monorepo) or (is_monorepo and service_name_for_tag):
             if rev_spec != current_release_commit_hexsha :
-                print(f"  {tag_label}: No new relevant commits found for range '{rev_spec}' after filtering.")
+                log(f"  {tag_label}: No new relevant commits found for range '{rev_spec}' after filtering.")
             else:
-                print(f"  {tag_label} (Release Date: "
+                log(f"  {tag_label} (Release Date: "
                       f"{release_datetime.strftime('%Y-%m-%d %H:%M:%S %Z')}): "
                       f"Processed {commits_processed_for_this_tag} initial relevant commits after filtering.")
 
@@ -280,24 +331,27 @@ def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool,
         elif not is_monorepo:
             global_previous_tag_commit_sha = current_release_commit_hexsha
 
+    if since:
+        log(f"INFO: {skipped_before_since} tags released before {since.date()} were skipped.")
     if cache is not None:
-        print(f"INFO: Cache: {cache_hits} of {len(sorted_annotated_tags)} tags reused.")
+        log(f"INFO: Cache: {cache_hits} of {len(sorted_annotated_tags) - skipped_before_since} tags reused.")
     return all_metrics
 
 
 RepoSpec = Dict[str, Any]  # {"path": str, "name": Optional[str], "monorepo": Optional[bool]}
 
 
-def load_config(config_path: str) -> Optional[Tuple[Dict[str, List[str]], List[RepoSpec]]]:
+def load_config(config_path: str) -> Optional[Tuple[Dict[str, List[str]], List[RepoSpec], Optional[str]]]:
     """
     Loads the JSON config file:
       {
         "teams": {"team-name": ["email-or-name", ...]},                       (optional)
-        "repositories": ["path", {"path": "...", "name": "...", "monorepo": false}]   (optional)
+        "repositories": ["path", {"path": "...", "name": "...", "monorepo": false}],   (optional)
+        "since": "1y"                                                          (optional, see --since)
       }
     Team members are matched case-insensitively against the commit author's email or name.
     Relative repository paths are resolved against the config file's directory.
-    Returns ({team_name: [lowercased identifiers]}, [repo specs]) or None if the file is unusable.
+    Returns ({team_name: [lowercased identifiers]}, [repo specs], since or None) or None if the file is unusable.
     """
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
@@ -341,7 +395,11 @@ def load_config(config_path: str) -> Optional[Tuple[Dict[str, List[str]], List[R
             "name": spec.get("name") or None,
             "monorepo": spec.get("monorepo"),
         })
-    return teams, repos
+    since = config.get("since")
+    if since is not None and not isinstance(since, str):
+        print("Error: 'since' must be a string such as \"2025-01-01\" or \"1y\".", file=sys.stderr)
+        return None
+    return teams, repos, since
 
 
 def unique_repo_names(specs: List[RepoSpec]) -> List[str]:
@@ -523,6 +581,20 @@ def main():
     )
 
     parser.add_argument(
+        "--since",
+        type=str,
+        default=None,
+        help=("Only report releases (tag dates) on or after this date: YYYY-MM-DD or a relative age "
+              "such as 1y, 6m, 8w, 90d. Skipped releases are not computed; later releases keep their "
+              "exact commit range. Can also be set as \"since\" in the config file.")
+    )
+    parser.add_argument(
+        "-j", "--jobs",
+        type=int,
+        default=4,
+        help="Number of repositories analysed in parallel."
+    )
+    parser.add_argument(
         "--cache",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -562,6 +634,7 @@ def main():
 
     teams: Optional[Dict[str, List[str]]] = None
     config_repos: List[RepoSpec] = []
+    config_since: Optional[str] = None
     config_path = args.config
     if not config_path and os.path.isfile(DEFAULT_CONFIG_FILE):
         config_path = DEFAULT_CONFIG_FILE
@@ -570,7 +643,7 @@ def main():
         loaded = load_config(config_path)
         if loaded is None:
             sys.exit(1)
-        config_teams, config_repos = loaded
+        config_teams, config_repos, config_since = loaded
         teams = config_teams or None
     group_by = args.group_by or ('team' if teams else 'service')
     if group_by == 'team' and not teams:
@@ -587,6 +660,17 @@ def main():
         repo_specs = [{"path": os.path.abspath("."), "name": None, "monorepo": None}]
     repo_names = unique_repo_names(repo_specs)
 
+    since: Optional[datetime] = None
+    since_raw = args.since or config_since
+    if since_raw:
+        try:
+            since = parse_since(since_raw)
+        except ValueError as e:
+            parser.error(str(e))
+        print(f"INFO: Only releases on or after {since.date()} are analysed.")
+    if args.jobs < 1:
+        parser.error("--jobs must be at least 1")
+
     # Construct full output filename with extension based on format
     base_name_from_arg = args.output_file
     # Remove any user-supplied extension from the base name if they provided one,
@@ -601,13 +685,19 @@ def main():
     cache: Optional[Cache] = load_cache(args.cache_file) if args.cache else None
     cached_before = len(cache["entries"]) if cache is not None else 0
 
-    detailed_metrics_data: List[MetricEntry] = []
-    for spec, repo_name in zip(repo_specs, repo_names):
+    def analyse(item: Tuple[RepoSpec, str]) -> List[MetricEntry]:
+        spec, repo_name = item
         is_monorepo = args.monorepo if spec.get("monorepo") is None else spec["monorepo"]
         print(f"Analyzing Git repository '{repo_name}' at: {spec['path']} "
               f"(monorepo mode {'ENABLED' if is_monorepo else 'DISABLED'})")
-        detailed_metrics_data.extend(
-            calculate_lead_time_metrics(spec["path"], is_monorepo, cache, repo_name))
+        return calculate_lead_time_metrics(spec["path"], is_monorepo, cache, repo_name, since)
+
+    # Repositories are independent and the work is git-subprocess bound, so threads are enough.
+    # map() keeps the config order, so the reports are identical whatever --jobs is.
+    detailed_metrics_data: List[MetricEntry] = []
+    with ThreadPoolExecutor(max_workers=min(args.jobs, len(repo_specs))) as pool:
+        for repo_metrics in pool.map(analyse, zip(repo_specs, repo_names)):
+            detailed_metrics_data.extend(repo_metrics)
 
     if cache is not None and len(cache["entries"]) != cached_before:
         save_cache(cache, args.cache_file)

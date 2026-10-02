@@ -10,6 +10,7 @@ This Python CLI script calculates the "Lead Time for Change" DORA metric for a g
 * Supports output in `CSV` and `JSON` formats.
 * Configurable repository path and output file.
 * Analyses several repositories in one run (repeat `-r`, or list them in the config file) and tags every row with its repository.
+* Can limit the analysis to recent releases (`--since`) and analyses repositories in parallel (`--jobs`).
 * Caches per-tag results between runs, so only new tags are processed after the first run.
 * Reports per service (default) or per team, using a team membership config file.
 
@@ -104,6 +105,12 @@ python dora_metrics.py -r ../a -r ../b                        # without a config
 * `name` (default: directory name) is the `repo_name` in the output; duplicates get a numeric suffix. `monorepo` overrides `--monorepo` for that repository.
 * Both reports gain a `repo_name` column, and the summary is grouped by month, repository and service/team. Non-monorepo repositories appear as `_overall_`.
 * The cache is shared by all repositories (the repository path is part of each key).
+
+### Faster runs
+
+* `--since 2025-01-01` (or a relative age: `1y`, `6m`, `8w`, `90d`) keeps only releases whose **tag date** is on or after the cutoff. It filters on release date, not commit date, so every kept release has exactly the same commits and lead times as in a full run (a commit-date cutoff would drop the longest-waiting commits). Older tags are skipped without walking their commits. It can also be set once in the config: `"since": "1y"`; the flag wins.
+* `-j N` / `--jobs N` (default 4) analyses N repositories at the same time. Output is identical whatever N is; log lines are prefixed with `[repo]`.
+* The cache still applies: tags already cached are reused, and widening `--since` later only computes the newly included tags.
 
 ### HTML report
 
