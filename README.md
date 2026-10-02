@@ -106,6 +106,10 @@ python dora_metrics.py -r ../a -r ../b                        # without a config
 * Both reports gain a `repo_name` column, and the summary is grouped by month, repository and service/team. Non-monorepo repositories appear as `_overall_`.
 * The cache is shared by all repositories (the repository path is part of each key).
 
+### Config validation
+
+The config is validated before any repository is read. All problems are listed at once and the run exits with status 1: unknown keys (so a typo like `repository` is caught), wrong types, teams without members, an invalid `since`, and repository paths that do not exist or are not Git repositories. Repositories passed with `-r` are checked the same way.
+
 ### Faster runs
 
 * `--since 2025-01-01` (or a relative age: `1y`, `6m`, `8w`, `90d`) keeps only releases whose **tag date** is on or after the cutoff. It filters on release date, not commit date, so every kept release has exactly the same commits and lead times as in a full run (a commit-date cutoff would drop the longest-waiting commits). Older tags are skipped without walking their commits. It can also be set once in the config: `"since": "1y"`; the flag wins.

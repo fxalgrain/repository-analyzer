@@ -44,6 +44,10 @@ With teams in the config (`./config.json` is auto-loaded, or `--config PATH`), `
 
 `main()` loops over repo specs (`-r` repeated, else `repositories` from `--config` via `load_config`, else cwd) and calls `calculate_lead_time_metrics` once per repo; per-repo `monorepo` overrides the flag. Every entry gets `repo_name` (`unique_repo_names`), added *after* the cache lookup so the cache never stores labels. Summary rows are keyed by (`YYYY-MM`, `repo_name`, service/team) and carry `commit_count`, which `dora_report.html` uses to weight averages when it merges rows (repo filter / group-by-repo).
 
+## Config validation
+
+`load_config` validates everything up front and prints *all* errors before exiting 1: unknown keys (top level and per repository), types, empty teams, `since` via `parse_since`, and repository paths via `check_repositories` (also applied in `main()` to `-r`/cwd repositories). Keep `CONFIG_KEYS`/`REPO_KEYS` in sync when adding options.
+
 ## Speed options
 
 `--since` (or `"since"` in the config; `parse_since` accepts `YYYY-MM-DD` or `Ny/Nm/Nw/Nd`) skips tags whose **release date** is before the cutoff. The skip happens in `calculate_lead_time_metrics` *after* the range is built and the previous-tag pointers are advanced, so the first in-window tag keeps its full-run range (never filter by commit date: it would drop the longest lead times). `--jobs` runs `calculate_lead_time_metrics` per repo in a `ThreadPoolExecutor` (`map` keeps config order, so output does not depend on it); each repo logs through `make_logger` with a `[repo]` prefix. The shared cache dict is written by distinct keys per repo, which is safe under the GIL.

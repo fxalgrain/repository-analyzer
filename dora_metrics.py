@@ -341,9 +341,13 @@ def calculate_lead_time_metrics(repo_path: str, is_monorepo: bool,
 RepoSpec = Dict[str, Any]  # {"path": str, "name": Optional[str], "monorepo": Optional[bool]}
 
 
+CONFIG_KEYS = {"teams", "repositories", "since"}
+REPO_KEYS = {"path", "name", "monorepo"}
+
+
 def load_config(config_path: str) -> Optional[Tuple[Dict[str, List[str]], List[RepoSpec], Optional[str]]]:
     """
-    Loads the JSON config file:
+    Loads and validates the JSON config file:
       {
         "teams": {"team-name": ["email-or-name", ...]},                       (optional)
         "repositories": ["path", {"path": "...", "name": "...", "monorepo": false}],   (optional)
@@ -351,7 +355,9 @@ def load_config(config_path: str) -> Optional[Tuple[Dict[str, List[str]], List[R
       }
     Team members are matched case-insensitively against the commit author's email or name.
     Relative repository paths are resolved against the config file's directory.
-    Returns ({team_name: [lowercased identifiers]}, [repo specs], since or None) or None if the file is unusable.
+    Every problem found is reported (not just the first), and unknown keys are rejected so that
+    typos such as "repository" do not silently change the analysis.
+    Returns ({team_name: [lowercased identifiers]}, [repo specs], since or None) or None if invalid.
     """
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
@@ -363,43 +369,85 @@ def load_config(config_path: str) -> Optional[Tuple[Dict[str, List[str]], List[R
         print(f"Error: config '{config_path}' must be a JSON object.", file=sys.stderr)
         return None
 
+    errors: List[str] = []
+    for key in config:
+        if key not in CONFIG_KEYS:
+            errors.append(f"unknown key '{key}' (expected: {', '.join(sorted(CONFIG_KEYS))})")
+
+    teams: Dict[str, List[str]] = {}
     teams_raw = config.get("teams", {})
     if not isinstance(teams_raw, dict):
-        print(f"Error: 'teams' in '{config_path}' must map team names to lists of members.", file=sys.stderr)
-        return None
-    teams: Dict[str, List[str]] = {}
-    for team_name, members in teams_raw.items():
-        if not isinstance(members, list) or not all(isinstance(m, str) for m in members):
-            print(f"Error: members of team '{team_name}' must be a list of strings.", file=sys.stderr)
-            return None
-        teams[team_name] = [m.strip().lower() for m in members if m.strip()]
+        errors.append("'teams' must map team names to lists of members")
+    else:
+        for team_name, members in teams_raw.items():
+            if not isinstance(members, list) or not all(isinstance(m, str) for m in members):
+                errors.append(f"team '{team_name}': members must be a list of strings")
+                continue
+            identifiers = [m.strip().lower() for m in members if m.strip()]
+            if not identifiers:
+                errors.append(f"team '{team_name}' has no members")
+            teams[team_name] = identifiers
 
-    repos_raw = config.get("repositories", [])
-    if not isinstance(repos_raw, list):
-        print(f"Error: 'repositories' in '{config_path}' must be a list.", file=sys.stderr)
-        return None
-    base_dir = os.path.dirname(os.path.abspath(config_path))
     repos: List[RepoSpec] = []
-    for item in repos_raw:
+    repos_raw = config.get("repositories", [])
+    base_dir = os.path.dirname(os.path.abspath(config_path))
+    if not isinstance(repos_raw, list):
+        errors.append("'repositories' must be a list")
+        repos_raw = []
+    for index, item in enumerate(repos_raw):
         spec = {"path": item} if isinstance(item, str) else item
-        if not isinstance(spec, dict) or not isinstance(spec.get("path"), str):
-            print("Error: each repository must be a path string or an object with a 'path'.", file=sys.stderr)
-            return None
-        if not isinstance(spec.get("name", ""), str) or not isinstance(spec.get("monorepo", True), bool):
-            print(f"Error: repository '{spec['path']}': 'name' must be a string and 'monorepo' a boolean.",
-                  file=sys.stderr)
-            return None
-        path = os.path.expanduser(spec["path"])
+        where = f"repositories[{index}]"
+        if not isinstance(spec, dict) or not isinstance(spec.get("path"), str) or not spec["path"].strip():
+            errors.append(f"{where}: must be a path string or an object with a non-empty 'path'")
+            continue
+        where = f"repositories[{index}] ('{spec['path']}')"
+        for key in spec:
+            if key not in REPO_KEYS:
+                errors.append(f"{where}: unknown key '{key}' (expected: {', '.join(sorted(REPO_KEYS))})")
+        if "name" in spec and (not isinstance(spec["name"], str) or not spec["name"].strip()):
+            errors.append(f"{where}: 'name' must be a non-empty string")
+        if "monorepo" in spec and not isinstance(spec["monorepo"], bool):
+            errors.append(f"{where}: 'monorepo' must be true or false")
         repos.append({
-            "path": os.path.normpath(os.path.join(base_dir, path)),
-            "name": spec.get("name") or None,
-            "monorepo": spec.get("monorepo"),
+            "path": os.path.normpath(os.path.join(base_dir, os.path.expanduser(spec["path"]))),
+            "name": spec["name"].strip() if isinstance(spec.get("name"), str) and spec["name"].strip() else None,
+            "monorepo": spec["monorepo"] if isinstance(spec.get("monorepo"), bool) else None,
         })
+    errors.extend(check_repositories(repos, where_prefix="repositories"))
+
     since = config.get("since")
-    if since is not None and not isinstance(since, str):
-        print("Error: 'since' must be a string such as \"2025-01-01\" or \"1y\".", file=sys.stderr)
+    if since is not None:
+        if not isinstance(since, str):
+            errors.append("'since' must be a string such as \"2025-01-01\" or \"1y\"")
+        else:
+            try:
+                parse_since(since)
+            except ValueError as e:
+                errors.append(str(e).replace("--since value", "'since' value"))
+
+    if errors:
+        print(f"Error: invalid config '{config_path}':", file=sys.stderr)
+        for error in errors:
+            print(f"  - {error}", file=sys.stderr)
         return None
     return teams, repos, since
+
+
+def check_repositories(specs: List[RepoSpec], where_prefix: str = "repository") -> List[str]:
+    """Returns one message per repository whose path is missing or is not inside a Git repository."""
+    errors: List[str] = []
+    for spec in specs:
+        path = spec["path"]
+        if not os.path.isdir(path):
+            errors.append(f"{where_prefix} '{path}': directory does not exist")
+            continue
+        try:
+            git.Repo(path, search_parent_directories=True)
+        except git.exc.InvalidGitRepositoryError:
+            errors.append(f"{where_prefix} '{path}': not a Git repository")
+        except Exception as e:
+            errors.append(f"{where_prefix} '{path}': cannot open ({e})")
+    return errors
 
 
 def unique_repo_names(specs: List[RepoSpec]) -> List[str]:
@@ -658,6 +706,14 @@ def main():
         repo_specs = config_repos
     else:
         repo_specs = [{"path": os.path.abspath("."), "name": None, "monorepo": None}]
+    if args.repo_path or not config_repos:
+        # repositories listed in the config were already checked by load_config
+        repo_errors = check_repositories(repo_specs)
+        if repo_errors:
+            print("Error: invalid repositories:", file=sys.stderr)
+            for error in repo_errors:
+                print(f"  - {error}", file=sys.stderr)
+            sys.exit(1)
     repo_names = unique_repo_names(repo_specs)
 
     since: Optional[datetime] = None
