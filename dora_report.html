@@ -60,6 +60,10 @@ td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
 td.msg { max-width: 460px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 details summary { cursor: pointer; color: var(--text-2); font-size: 12.5px; margin-top: 10px; }
 .hidden { display: none; }
+.filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+.filters label { font-size: 12.5px; color: var(--text-2); display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+.filters select { font: inherit; font-size: 13px; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; }
+.filters .lbl { font-size: 12.5px; font-weight: 600; }
 </style>
 </head>
 <body>
@@ -76,6 +80,12 @@ details summary { cursor: pointer; color: var(--text-2); font-size: 12.5px; marg
     The summary alone gives the monthly charts; the detailed file adds distribution and slowest commits.</div>
 
   <div id="report" class="hidden">
+    <div class="card hidden" id="filters"><div class="filters">
+      <span class="lbl">Repositories</span><span class="filters" id="repo-list"></span>
+      <button id="repo-all" type="button">All</button><button id="repo-none" type="button">None</button>
+      <span class="lbl">Group by</span>
+      <select id="group-mode"><option value="default">Service / team</option><option value="repo">Repository</option></select>
+    </div></div>
     <div class="kpis" id="kpis"></div>
     <div class="card"><h2>Average lead time per month</h2><p class="sub">Days from commit to release tag, averaged over commits.</p><div class="legend" data-legend></div><div class="chart" id="c-lead"></div></div>
     <div class="card"><h2>Releases per month</h2><p class="sub">Distinct release tags.</p><div class="legend" data-legend></div><div class="chart" id="c-rel"></div></div>
@@ -91,6 +101,7 @@ const $ = s => document.querySelector(s);
 const NS = 'http://www.w3.org/2000/svg';
 const MAXS = 8;
 let summary = null, detail = null;
+let selRepos = null, repoKey = '', groupMode = 'default'; // selRepos: Set of visible repos, null until known
 
 // ---------- CSV ----------
 function parseCSV(text) {
@@ -115,19 +126,24 @@ function ingest(text) {
 }
 
 // ---------- model ----------
-const groupKey = r => r.team_name ?? r.service_name ?? '_overall_';
+const baseKey = r => (r.team_name ?? r.service_name) || '_overall_';
+const groupKey = r => groupMode === 'repo' && 'repo_name' in r ? r.repo_name : baseKey(r);
+const visible = r => !('repo_name' in r) || !selRepos || selRepos.has(r.repo_name);
+const allRepos = () => [...new Set((summary || detail || []).map(r => r.repo_name).filter(x => x != null))].sort();
+const detailRows = () => detail ? detail.filter(visible) : null;
 function model() {
   let months = [];
   if (summary) {
-    months = summary.map(r => ({ m: r.year_month, g: groupKey(r), lead: +r.average_lead_time_days, rel: +r.release_count }));
+    // w = commits behind the average (falls back to releases for older summaries)
+    months = summary.filter(visible).map(r => ({ m: r.year_month, g: groupKey(r), lead: +r.average_lead_time_days, rel: +r.release_count, w: +(r.commit_count ?? r.release_count) }));
   } else if (detail) {
     const agg = new Map();
-    for (const r of detail) {
+    for (const r of detailRows()) {
       const m = r.release_date.slice(0, 7), g = groupKey(r), k = m + '|' + g;
       const a = agg.get(k) || { m, g, sum: 0, n: 0, tags: new Set() };
-      a.sum += +r.lead_time_days; a.n++; a.tags.add(r.release_tag); agg.set(k, a);
+      a.sum += +r.lead_time_days; a.n++; a.tags.add((r.repo_name ?? '') + '|' + r.release_tag); agg.set(k, a);
     }
-    months = [...agg.values()].map(a => ({ m: a.m, g: a.g, lead: a.sum / a.n, rel: a.tags.size }));
+    months = [...agg.values()].map(a => ({ m: a.m, g: a.g, lead: a.sum / a.n, rel: a.tags.size, w: a.n }));
   }
   // top groups by release count; rest folded into "Other"
   const tot = new Map();
@@ -140,9 +156,9 @@ function model() {
   const k = new Map();
   for (const d of months) {
     const g = map(d.g), key = d.m + '|' + g, a = k.get(key) || { m: d.m, g, w: 0, ls: 0, rel: 0 };
-    a.w += d.rel; a.ls += d.lead * d.rel; a.rel += d.rel; k.set(key, a);
+    a.w += d.w; a.ls += d.lead * d.w; a.rel += d.rel; k.set(key, a);
   }
-  const data = [...k.values()].map(a => ({ m: a.m, g: a.g, lead: a.w ? a.ls / a.w : 0, rel: a.rel }));
+  const data = [...k.values()].map(a => ({ m: a.m, g: a.g, lead: a.w ? a.ls / a.w : 0, rel: a.rel, w: a.w }));
   const all = [...new Set(data.map(d => d.m))].sort();
   const span = []; // continuous month axis
   if (all.length) {
@@ -254,33 +270,51 @@ function histogram(host, rows) {
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 function percentile(sorted, p) { return sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))] : 0; }
 
+function buildFilters() {
+  const repos = allRepos(), key = repos.join('\n');
+  $('#filters').classList.toggle('hidden', repos.length < 2);
+  if (key === repoKey) return;
+  repoKey = key; selRepos = new Set(repos);
+  $('#repo-list').innerHTML = repos.map(r => `<label><input type="checkbox" value="${esc(r)}" checked>${esc(r)}</label>`).join('');
+}
 function render() {
   if (!summary && !detail) return;
   $('#report').classList.remove('hidden'); $('#drop').classList.add('hidden');
-  const M = model();
+  buildFilters();
+  const M = model(), rows = detailRows();
   document.querySelectorAll('[data-legend]').forEach(l => {
     l.innerHTML = M.names.length > 1 ? M.names.map(n => `<span><i style="background:${M.color(n)}"></i>${esc(n)}</span>`).join('') : '';
   });
   // KPIs
-  const totRel = M.data.reduce((s, d) => s + d.rel, 0), avg = totRel ? M.data.reduce((s, d) => s + d.lead * d.rel, 0) / totRel : 0;
-  const k = [[M.span.length ? `${M.span[0]} → ${M.span.at(-1)}` : '—', 'period'], [totRel, 'releases (group-month sums)'], [fmt(avg) + ' d', 'avg lead time (release-weighted)']];
-  if (detail) {
-    const lt = detail.map(r => +r.lead_time_days).sort((a, b) => a - b);
+  const totRel = M.data.reduce((s, d) => s + d.rel, 0), totW = M.data.reduce((s, d) => s + d.w, 0), avg = totW ? M.data.reduce((s, d) => s + d.lead * d.w, 0) / totW : 0;
+  const k = [[M.span.length ? `${M.span[0]} → ${M.span.at(-1)}` : '—', 'period'], [totRel, 'releases (group-month sums)'], [fmt(avg) + ' d', 'avg lead time (commit-weighted)']];
+  if (rows) {
+    const lt = rows.map(r => +r.lead_time_days).sort((a, b) => a - b);
     k.push([fmt(percentile(lt, .5)) + ' d', 'median lead time'], [fmt(percentile(lt, .9)) + ' d', 'p90 lead time'], [lt.length, 'commits']);
   }
   $('#kpis').innerHTML = k.map(([v, l]) => `<div class="kpi"><b>${esc(v)}</b><span>${l}</span></div>`).join('');
   lineChart($('#c-lead'), M, 'lead', 'days');
   stackedBars($('#c-rel'), M);
   $('#card-dist').classList.toggle('hidden', !detail); $('#card-slow').classList.toggle('hidden', !detail);
-  if (detail) {
-    histogram($('#c-dist'), detail);
-    const top = [...detail].sort((a, b) => b.lead_time_days - a.lead_time_days).slice(0, 15);
-    $('#slow').innerHTML = '<table><tr><th>Commit</th><th>Group</th><th>Release</th><th class="n">Lead (d)</th><th>Message</th></tr>' +
-      top.map(r => `<tr><td>${esc(r.commit_hash.slice(0, 8))}</td><td>${esc(groupKey(r))}</td><td>${esc(r.release_tag)}</td><td class="n">${(+r.lead_time_days).toFixed(1)}</td><td class="msg" title="${esc(r.commit_summary)}">${esc(r.commit_summary)}</td></tr>`).join('') + '</table>';
+  if (rows) {
+    histogram($('#c-dist'), rows);
+    const top = [...rows].sort((a, b) => b.lead_time_days - a.lead_time_days).slice(0, 15);
+    const hasRepo = top.length && 'repo_name' in top[0];
+    $('#slow').innerHTML = `<table><tr><th>Commit</th>${hasRepo ? '<th>Repo</th>' : ''}<th>Group</th><th>Release</th><th class="n">Lead (d)</th><th>Message</th></tr>` +
+      top.map(r => `<tr><td>${esc(r.commit_hash.slice(0, 8))}</td>${hasRepo ? `<td>${esc(r.repo_name)}</td>` : ''}<td>${esc(groupKey(r))}</td><td>${esc(r.release_tag)}</td><td class="n">${(+r.lead_time_days).toFixed(1)}</td><td class="msg" title="${esc(r.commit_summary)}">${esc(r.commit_summary)}</td></tr>`).join('') + '</table>';
   }
   $('#tbl').innerHTML = '<table><tr><th>Month</th><th>Group</th><th class="n">Avg lead (d)</th><th class="n">Releases</th></tr>' +
     [...M.data].sort((a, b) => a.m.localeCompare(b.m) || a.g.localeCompare(b.g)).map(d => `<tr><td>${d.m}</td><td>${esc(d.g)}</td><td class="n">${d.lead.toFixed(2)}</td><td class="n">${d.rel}</td></tr>`).join('') + '</table>';
 }
+
+// ---------- filters ----------
+$('#repo-list').addEventListener('change', e => {
+  selRepos = new Set([...document.querySelectorAll('#repo-list input:checked')].map(i => i.value)); render();
+});
+const setAll = on => { document.querySelectorAll('#repo-list input').forEach(i => i.checked = on); selRepos = new Set(on ? allRepos() : []); render(); };
+$('#repo-all').addEventListener('click', () => setAll(true));
+$('#repo-none').addEventListener('click', () => setAll(false));
+$('#group-mode').addEventListener('change', e => { groupMode = e.target.value; render(); });
 
 // ---------- input ----------
 async function readFiles(files) { for (const f of files) ingest(await f.text()); render(); }

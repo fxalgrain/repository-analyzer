@@ -1,0 +1,12 @@
+{
+  "teams": {
+    "team-a": ["alice@example.com", "Bob Smith"],
+    "team-b": ["carol@example.com"]
+  },
+  "since": "1y",
+  "repositories": [
+    "../service-repo",
+    {"path": "~/code/monorepo", "service_path": "packages/{service}"},
+    {"path": "../frontend", "name": "web", "monorepo": false}
+  ]
+}

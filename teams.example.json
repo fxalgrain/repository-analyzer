@@ -1,6 +1,0 @@
-{
-  "teams": {
-    "team-a": ["alice@example.com", "Bob Smith"],
-    "team-b": ["carol@example.com"]
-  }
-}
